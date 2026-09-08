@@ -34,4 +34,14 @@ describe('toObject', () => {
             : value);
         expect(JSON.parse(json)).to.deep.equal({ '1': '5', '2': 'x', '3': { '1': '1' }, '4': 'bytes(2)' });
     });
+
+    it('keeps only the last-written member of a oneof', () => {
+        const choice = schema([messageType('O', [
+            fieldDef({ number: 3, name: 'a', type: scalar('int32'), oneof: 'c' }),
+            fieldDef({ number: 4, name: 'b', type: scalar('int32'), oneof: 'c' }),
+            fieldDef({ number: 5, name: 'other', type: scalar('int32') })
+        ])]);
+        expect(toObject(decode(hex('18 01 20 02 18 03 28 09'), { schema: choice }).message)).to.deep.equal({ a: 3n, other: 9n });
+        expect(toObject(decode(hex('18 01 20 02'), { schema: choice }).message)).to.deep.equal({ b: 2n });
+    });
 });

@@ -31,4 +31,9 @@ describe('isValidProtobuf', () => {
         expect(isValidProtobuf(utf8('{"json": true}'))).to.equal(false);
         expect(isValidProtobuf(utf8('<html><body>Hello</body></html>'))).to.equal(false);
     });
+
+    it('rejects overflowing tags and lengths', () => {
+        expect(isValidProtobuf(hex('0a 80 80 80 80 80 80 80 80 80 02'))).to.equal(false);
+        expect(isValidProtobuf(hex('88 80 80 80 80 80 80 80 80 02 01'))).to.equal(false);
+    });
 });

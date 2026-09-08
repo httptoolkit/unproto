@@ -192,4 +192,12 @@ describe('decodeWire', () => {
         const field = wire.fields[0]!;
         expect(field.kind === 'len' && field.bytes.buffer).to.equal(input.buffer);
     });
+
+    it('rejects tags and lengths whose varints overflow 64 bits', () => {
+        const length = decodeWire(hex('0a 80 80 80 80 80 80 80 80 80 02'));
+        expectProblem(length.problems, 'length-too-large', 0);
+        expect(length.fields).to.deep.equal([]);
+        // 2^64 + 8 would read as field 1 if the high bits were dropped
+        expectProblem(decodeWire(hex('88 80 80 80 80 80 80 80 80 02 01')).problems, 'invalid-tag', 0);
+    });
 });

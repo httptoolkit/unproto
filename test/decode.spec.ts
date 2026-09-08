@@ -269,6 +269,70 @@ describe('decode without a schema', () => {
             '7': [1n, 2n, 3n, 4n, 5n]
         });
     });
+
+    it('keeps a nested message whose text child explains the payload', () => {
+        expect(toObject(decode(hex('0a 08 0a 06 61 62 63 64 65 66')).message)).to.deep.equal({ '1': { '1': 'abcdef' } });
+        expect(toObject(decode(lenField(1, lenField(1, 'Savy Soda'))).message)).to.deep.equal({ '1': { '1': 'Savy Soda' } });
+        expect(toObject(decode(lenField(4, lenField(5, 'Savy Soda'))).message)).to.deep.equal({ '4': { '5': 'Savy Soda' } });
+        expect(toObject(decode(lenField(4, lenField(5, 'x'.repeat(40)))).message)).to.deep.equal({ '4': { '5': 'x'.repeat(40) } });
+        expect(toObject(decode(lenField(2, concat(lenField(1, 'Hearthstone'), varintField(2, 3)))).message))
+            .to.deep.equal({ '2': { '1': 'Hearthstone', '2': 3n } });
+        expect(toObject(decode(lenField(1, concat(lenField(1, 'com.blizzard.wtcg.hearthstone'), lenField(2, 'https://example.com/a/b?c=d')))).message))
+            .to.deep.equal({ '1': { '1': 'com.blizzard.wtcg.hearthstone', '2': 'https://example.com/a/b?c=d' } });
+    });
+
+    it('still reads ordinary text as text', () => {
+        for (const text of ['Hearthstone', 'line one\nline two', 'a\tb\tc', '* item one', '"quoted"', 'Zebra', 'jane@example.com', '2024-01-01']) {
+            expect(toObject(decode(lenField(1, text)).message), text).to.deep.equal({ '1': text });
+        }
+    });
+
+    it('keeps a coherent nested message despite large field numbers', () => {
+        expect(toObject(decode(hex('0a 09 c0 3e 01 c8 3e 02 d0 3e 03')).message))
+            .to.deep.equal({ '1': { '1000': 1n, '1001': 2n, '1002': 3n } });
+    });
+
+    it('preserves a leading byte order mark', () => {
+        expect(toObject(decode(hex('0a 06 ef bb bf 61 62 63')).message)).to.deep.equal({ '1': '\ufeffabc' });
+    });
+
+    it('handles a field seen as both fixed32 and fixed64', () => {
+        const result = decode(hex('0d 00 00 80 3f 09 00 00 00 00 00 00 f0 3f'));
+        expectProblem(result.problems, 'wire-type-mismatch', 0);
+        const f = result.message.fields.get(1)!;
+        expect(f.values[0]!.kind).to.equal('raw');
+        expect(f.values[1]).to.deep.equal({ kind: 'double', value: 1 });
+        expect(f.def!.type).to.deep.equal(scalar('double'));
+
+        const nested = decode(lenField(3, hex('0d 00 00 80 3f 09 00 00 00 00 00 00 f0 3f 0d 00 00 00 40')));
+        expect(nested.message.fields.get(3)).to.not.equal(undefined);
+    });
+
+    it('treats single-element packed chunks as valid but uninformative', () => {
+        const floats = decode(hex('0a 08 00 00 80 3f 00 00 20 40 0a 04 00 00 40 40'));
+        expectNoProblems(floats.problems);
+        expect(floats.message.fields.get(1)!.values).to.deep.equal([
+            { kind: 'float', value: 1 }, { kind: 'float', value: 2.5 }, { kind: 'float', value: 3 }
+        ]);
+
+        const withUnpacked = decode(hex('08 01 0a 01 02'));
+        expectNoProblems(withUnpacked.problems);
+        expect(toObject(withUnpacked.message)).to.deep.equal({ '1': [1n, 2n] });
+
+        // A lone single double (1.1) that reads as nothing else stays bytes
+        const payload = hex('9a 99 99 99 99 99 f1 3f');
+        expect(toObject(decode(lenField(1, payload)).message)).to.deep.equal({ '1': payload });
+    });
+
+    it('decodes packed alternatives as values, not raw records', () => {
+        const f = field(lenField(1, 'hello'), 1);
+        const packed = f.alternatives.find(a => a.packed);
+        expect(packed).to.not.equal(undefined);
+        expect(packed!.values.map(v => v.kind === 'int64' && v.value)).to.deep.equal([104n, 101n, 108n, 108n, 111n]);
+        for (const alt of f.alternatives) {
+            expect(alt.values.some(v => v.kind === 'raw'), JSON.stringify(alt.type)).to.equal(false);
+        }
+    });
 });
 
 describe('decode with a schema', () => {
@@ -407,5 +471,33 @@ describe('decode with a schema', () => {
         const object = toObject(result.message);
         expect(object['id']).to.equal(2n);
         expect(object['address']).to.deep.equal({ zip: 1n, '9': 1n });
+    });
+
+    it('reports overflowing values inside packed fields', () => {
+        const uint64s = schema([messageType('P', [fieldDef({ number: 1, name: 'v', type: scalar('uint64'), cardinality: 'repeated' })])]);
+        const result = decode(hex('0a 0a 80 80 80 80 80 80 80 80 80 02'), { schema: uint64s });
+        expectProblem(result.problems, 'varint-overflow', 2);
+        expect(toObject(result.message)).to.deep.equal({ v: [0n] });
+    });
+
+    it('preserves a leading byte order mark in string fields', () => {
+        const text = schema([messageType('S', [fieldDef({ number: 1, name: 's', type: scalar('string') })])]);
+        expect(toObject(decode(hex('0a 06 ef bb bf 61 62 63'), { schema: text }).message)).to.deep.equal({ s: '\ufeffabc' });
+    });
+
+    it('never lets an inferred type replace a supplied one with the same name', () => {
+        const supplied = schema([
+            messageType('T', [fieldDef({ number: 2, name: 'known', type: { kind: 'message', name: 'T.Field1' } })]),
+            messageType('T.Field1', [fieldDef({ number: 1, name: 'real', type: scalar('string') })])
+        ]);
+        // Unknown field 1 would be inferred as T.Field1, colliding with the supplied type
+        const result = decode(hex('0a 02 08 05 12 05 0a 03 61 62 63'), { schema: supplied, type: 'T' });
+        expect(result.problems.map(p => p.code)).to.deep.equal(['unknown-field']);
+        expect(toObject(result.message)).to.deep.equal({ '1': { '1': 5n }, known: { real: 'abc' } });
+        expect(result.message.fields.get(1)!.def!.type).to.deep.equal({ kind: 'message', name: 'T.Field1_2' });
+
+        expect(result.schema).to.not.equal(supplied);
+        expect([...result.schema.types.keys()]).to.deep.equal(['T', 'T.Field1', 'T.Field1_2']);
+        expect(supplied.types.has('T.Field1_2')).to.equal(false);
     });
 });
