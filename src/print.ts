@@ -56,15 +56,21 @@ export function printProto(schema: Schema, options: PrintProtoOptions = {}): str
     return lines.join('\n') + '\n';
 }
 
+/**
+ * proto3 cannot express group encoding, and proto2 can only express it
+ * through the group declaration syntax, which ties the field name to the
+ * type name; edition 2023 expresses both faithfully, so a schema with
+ * delimited fields prints in that dialect.
+ */
 function effectiveSyntax(schema: Schema): Syntax {
-    if (schema.syntax !== 'proto3') return schema.syntax;
+    if (schema.syntax === 'editions') return 'editions';
     for (const type of schema.types.values()) {
         if (type.kind !== 'message') continue;
         for (const field of type.fields.values()) {
             if (field.delimited) return 'editions';
         }
     }
-    return 'proto3';
+    return schema.syntax;
 }
 
 /** Groups types under their enclosing type ('' for top level), keeping the schema's order */
@@ -175,7 +181,8 @@ function fieldOptions(printer: Printer, field: FieldDef, scalarLike: boolean): s
     } else {
         if (repeatedPackable && !field.packed) options.push('features.repeated_field_encoding = EXPANDED');
         if (field.delimited && field.type.kind === 'message') options.push('features.message_encoding = DELIMITED');
-        if (field.cardinality !== 'repeated' && scalarLike && field.presence === 'implicit') options.push('features.field_presence = IMPLICIT');
+        if (field.cardinality === 'required') options.push('features.field_presence = LEGACY_REQUIRED');
+        else if (field.cardinality !== 'repeated' && scalarLike && field.presence === 'implicit') options.push('features.field_presence = IMPLICIT');
     }
     if (syntax !== 'proto3' && field.defaultValue !== undefined) options.push(`default = ${field.defaultValue}`);
     if (field.jsonName !== undefined) options.push(`json_name = "${escapeString(field.jsonName)}"`);

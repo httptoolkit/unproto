@@ -1,9 +1,9 @@
 import { decodeWire, type WireMessage } from './wire.ts';
 import type { Problem } from './problem.ts';
-import type { FieldDef, MessageType, NamedType, Schema } from './schema.ts';
+import type { MessageType, NamedType, Schema } from './schema.ts';
 import type { Message } from './values.ts';
 import { inferSchemaFromWire } from './infer.ts';
-import { extendSchema, findMessageType, inferUnknownFields, interpretMessage, type InterpretContext } from './interpret.ts';
+import { createContext, extendSchema, findMessageType, inferUnknownFields, interpretMessage } from './interpret.ts';
 
 export interface DecodeOptions {
     /** Decode against this schema. Without one, a schema is inferred from the message itself. */
@@ -50,15 +50,14 @@ export function decode(input: Uint8Array, options: DecodeOptions = {}): DecodeRe
 
     const types = new Map<string, NamedType>(schema.types);
     const inferred = new Set<string>(options.schema ? [] : types.keys());
-    const extensions = new Map<string, Map<number, FieldDef>>();
-    const ctx: InterpretContext = { types, inferred, extensions, problems, recursionLimit };
+    const ctx = createContext(types, inferred, problems, recursionLimit);
 
     if (options.schema && type) inferUnknownFields([wire.fields], type, ctx);
     const message = interpretMessage(wire.fields, type, ctx, [], 0);
 
     return {
         message,
-        schema: options.schema && (inferred.size > 0 || extensions.size > 0) ? extendSchema(schema, ctx) : schema,
+        schema: options.schema && (inferred.size > 0 || ctx.extensions.size > 0) ? extendSchema(schema, ctx) : schema,
         wire,
         problems
     };

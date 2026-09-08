@@ -121,6 +121,27 @@ describe('printProto', () => {
         expect({ ...root.lookupEnum('shop.Status').values }).to.deep.equal({ NEW: 0, PAID: 1, SETTLED: 1 });
     });
 
+    it('prints proto2 groups and required fields faithfully by promoting to editions', () => {
+        const proto2 = schema([
+            messageType('G', [
+                fieldDef({ number: 1, name: 'grp', type: { kind: 'message', name: 'G.Grp' }, delimited: true, cardinality: 'required' }),
+                fieldDef({ number: 2, name: 'n', type: scalar('int32'), cardinality: 'required' }),
+                fieldDef({ number: 3, name: 'tags', type: scalar('int32'), cardinality: 'repeated', packed: false })
+            ]),
+            messageType('G.Grp', [fieldDef({ number: 1, name: 'x', type: scalar('int32') })])
+        ], { syntax: 'proto2' });
+        const text = printProto(proto2);
+        expect(text).to.include('edition = "2023";');
+        expect(text).to.include('Grp grp = 1 [features.message_encoding = DELIMITED, features.field_presence = LEGACY_REQUIRED];');
+        expect(text).to.include('int32 n = 2 [features.field_presence = LEGACY_REQUIRED];');
+        expect(text).to.include('repeated int32 tags = 3 [features.repeated_field_encoding = EXPANDED];');
+
+        const root = parse(text);
+        const G = root.lookupType('G');
+        expect(() => G.decode(hex('0b 08 01 0c 10 05'))).to.not.throw();
+        expect(() => G.decode(hex('10 05'))).to.throw(/missing required 'grp'/);
+    });
+
     it('uses the shortest type reference that resolves correctly', () => {
         const s = schema([
             messageType('pkg.A', [

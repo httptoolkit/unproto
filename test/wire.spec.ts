@@ -199,6 +199,11 @@ describe('decodeWire', () => {
         expect(wire.fields[0]).to.deep.include({ kind: 'len', number: 1, bytes: hex('41'), nonCanonicalLength: true });
     });
 
+    it('reports a truncated long tag or length as truncated, not invalid', () => {
+        expectProblem(decodeWire(hex('88 80 80 80 80 80 80 81')).problems, 'truncated', 0);
+        expectProblem(decodeWire(hex('0a 80 80 80 80 80 80 80 81')).problems, 'truncated', 0);
+    });
+
     it('rejects tags and lengths whose varints overflow 64 bits', () => {
         const length = decodeWire(hex('0a 80 80 80 80 80 80 80 80 80 02'));
         expectProblem(length.problems, 'length-too-large', 0);

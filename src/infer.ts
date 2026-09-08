@@ -14,7 +14,6 @@ import {
     analyzePackedFixed,
     analyzePackedVarints,
     isReasonableFloat,
-    isWellFormed,
     BYTES_SCORE,
     NEUTRAL_SCORE,
     type AnalysisCache,
@@ -226,11 +225,24 @@ export class Inferrer {
 
     /**
      * At the recursion limit payloads are not analysed as messages. That only
-     * loses information if one actually is well-formed protobuf, so only then
-     * is it reported, with the position of the record concerned.
+     * loses information if the message reading would have won, so each payload
+     * is scored one level deep (without the cache, which holds the unanalysed
+     * result) and only a payload that reads best as a message is reported.
      */
     private reportUnanalysed(occurrences: readonly WireLen[], fieldPath: readonly number[]): void {
-        const skipped = occurrences.find(o => o.bytes.length > 0 && isWellFormed(decodeWire(o.bytes, { offset: o.valueRange.start })));
+        const skipped = occurrences.find(o => {
+            if (o.bytes.length === 0) return false;
+            const analysis = analyzeLen(o.bytes, o.valueRange.start, this.recursionLimit - 1, this.recursionLimit, new WeakMap());
+            if (!analysis.message) return false;
+            const others = Math.max(
+                BYTES_SCORE,
+                analysis.string?.score ?? 0,
+                analysis.packedVarint?.score ?? 0,
+                analysis.packedI32?.score ?? 0,
+                analysis.packedI64?.score ?? 0
+            );
+            return analysis.message.score >= others;
+        });
         if (!skipped) return;
         this.problems.push({
             code: 'recursion-limit',

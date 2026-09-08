@@ -226,8 +226,9 @@ export function analyzePackedVarints(bytes: Uint8Array): PackedCandidate | undef
     // Random binary that happens to parse as varints gives mostly wide values
     if (wide * 2 > count) score -= 0.15;
     else if (large) score -= 0.1;
-    // Any run of ASCII text is also a run of single-byte varints, which is no evidence at all
-    if (printableBytes * 5 >= count * 4) score -= 0.25;
+    // Text is also a run of single-byte varints, which is no evidence at all; anything
+    // that is not entirely text keeps the benefit of the doubt
+    if (printableBytes === count) score -= 0.25;
     return { count, score };
 }
 
@@ -256,7 +257,11 @@ export function analyzePackedFixed(bytes: Uint8Array, size: 4 | 8): PackedCandid
         if (int >= SMALL_INT_LIMIT[size] || int < -SMALL_INT_LIMIT[size]) allSmallInts = false;
         if (size === 8) {
             if (view.getUint32(i * size, true) !== 0) cleanLowWords = false;
-            if (!isReasonableFloat(view.getFloat32(i * size, true), 4) || !isReasonableFloat(view.getFloat32(i * size + 4, true), 4)) {
+            // A float someone wrote has a short mantissa; a double's low word does not
+            const low = view.getUint32(i * size, true);
+            if ((low & 0xff) !== 0
+                || !isReasonableFloat(view.getFloat32(i * size, true), 4)
+                || !isReasonableFloat(view.getFloat32(i * size + 4, true), 4)) {
                 halvesAreFloats = false;
             }
         }

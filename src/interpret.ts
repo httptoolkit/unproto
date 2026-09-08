@@ -26,8 +26,16 @@ export interface InterpretContext {
     readonly inferred: Set<string>;
     /** Definitions inferred for fields the schema lacks, by containing type name then field number */
     readonly extensions: Map<string, Map<number, FieldDef>>;
+    /** Names of message types the schema refers to but does not define; each is reported once */
+    readonly missingTypes: Set<string>;
+    /** Set when inference met group encoding, which a proto3 schema cannot express */
+    needsEditions: boolean;
     readonly problems: Problem[];
     readonly recursionLimit: number;
+}
+
+export function createContext(types: Map<string, NamedType>, inferred: Set<string>, problems: Problem[], recursionLimit: number): InterpretContext {
+    return { types, inferred, extensions: new Map(), missingTypes: new Set(), needsEditions: false, problems, recursionLimit };
 }
 
 /** The occurrences of one undefined field across every instance of its containing type */
@@ -37,7 +45,14 @@ export interface UnknownFieldGroup {
     /** Depth and path of the first containing message instance seen */
     readonly depth: number;
     readonly path: readonly number[];
+    /** One entry per instance of the containing type, empty where the field was absent */
     readonly perSample: WireField[][];
+}
+
+export interface UnknownFieldCollector {
+    readonly groups: Map<string, UnknownFieldGroup>;
+    /** How many instances of each containing type have been seen */
+    readonly instances: Map<string, number>;
 }
 
 /**
@@ -52,10 +67,12 @@ export function collectUnknownFields(
     ctx: InterpretContext,
     path: readonly number[],
     depth: number,
-    groups: Map<string, UnknownFieldGroup>
+    collector: UnknownFieldCollector
 ): void {
+    const instance = collector.instances.get(type.fullName) ?? 0;
+    collector.instances.set(type.fullName, instance + 1);
+
     const unknownHere = new Map<number, WireField[]>();
-    const quiet: InterpretContext = { ...ctx, problems: [] };
     for (const occ of fields) {
         const def = type.fields.get(occ.number);
         if (!def) {
@@ -65,23 +82,23 @@ export function collectUnknownFields(
             continue;
         }
         if ((def.type.kind !== 'message' && def.type.kind !== 'map') || depth >= ctx.recursionLimit) continue;
-        const nestedType = resolveMessageType(def.type, quiet, path);
-        if (!nestedType) continue;
+        const nestedType = resolveMessageType(def.type, ctx, path, mapEntryName(type.fullName, def));
         const nestedPath = [...path, occ.number];
         if (occ.kind === 'len') {
             const wire = decodeWire(occ.bytes, { offset: occ.valueRange.start, recursionLimit: ctx.recursionLimit });
-            collectUnknownFields(wire.fields, nestedType, ctx, nestedPath, depth + 1, groups);
+            collectUnknownFields(wire.fields, nestedType, ctx, nestedPath, depth + 1, collector);
         } else if (occ.kind === 'group') {
-            collectUnknownFields(occ.fields, nestedType, ctx, nestedPath, depth + 1, groups);
+            collectUnknownFields(occ.fields, nestedType, ctx, nestedPath, depth + 1, collector);
         }
     }
     for (const [number, occurrences] of unknownHere) {
         const key = `${type.fullName}#${number}`;
-        let group = groups.get(key);
+        let group = collector.groups.get(key);
         if (!group) {
             group = { typeName: type.fullName, number, depth, path, perSample: [] };
-            groups.set(key, group);
+            collector.groups.set(key, group);
         }
+        while (group.perSample.length < instance) group.perSample.push([]);
         group.perSample.push(occurrences);
     }
 }
@@ -97,11 +114,13 @@ export function inferUnknownFields(
     ctx: InterpretContext,
     cache?: AnalysisCache
 ): void {
-    const groups = new Map<string, UnknownFieldGroup>();
-    for (const fields of samples) collectUnknownFields(fields, type, ctx, [], 0, groups);
-    if (groups.size === 0) return;
+    const collector: UnknownFieldCollector = { groups: new Map(), instances: new Map() };
+    for (const fields of samples) collectUnknownFields(fields, type, ctx, [], 0, collector);
+    if (collector.groups.size === 0) return;
     const inferrer = new Inferrer(ctx.types, ctx.recursionLimit, ctx.inferred, ctx.problems, cache);
-    for (const group of groups.values()) {
+    for (const group of collector.groups.values()) {
+        const instances = collector.instances.get(group.typeName) ?? group.perSample.length;
+        while (group.perSample.length < instances) group.perSample.push([]);
         const def = inferrer.inferField(group.number, group.perSample, group.typeName, group.depth, group.path);
         let fields = ctx.extensions.get(group.typeName);
         if (!fields) {
@@ -110,17 +129,36 @@ export function inferUnknownFields(
         }
         fields.set(group.number, def);
     }
+    if (inferrer.needsEditions) ctx.needsEditions = true;
 }
 
-/** The supplied schema plus inferred types, with inferred fields added to the types they were found in */
+/**
+ * The supplied schema plus inferred types, with inferred fields added to
+ * the types they were found in. Types the schema referred to but did not
+ * define are reconstructed from what was inferred inside them.
+ */
 export function extendSchema(schema: Schema, ctx: InterpretContext): Schema {
     const types = new Map(ctx.types);
     for (const [typeName, fields] of ctx.extensions) {
         const original = types.get(typeName);
-        if (original?.kind !== 'message') continue;
-        types.set(typeName, { ...original, fields: new Map([...original.fields, ...fields]) });
+        if (original?.kind === 'message') {
+            types.set(typeName, { ...original, fields: new Map([...original.fields, ...fields]) });
+        } else if (!original && ctx.missingTypes.has(typeName)) {
+            types.set(typeName, {
+                kind: 'message',
+                name: typeName.slice(typeName.lastIndexOf('.') + 1),
+                fullName: typeName,
+                fields: new Map(fields),
+                oneofs: [],
+                mapEntry: false,
+                messageSet: false
+            });
+        }
     }
-    return { ...schema, types };
+    const syntax = ctx.needsEditions && schema.syntax === 'proto3'
+        ? { syntax: 'editions' as const, edition: '2023' as const }
+        : {};
+    return { ...schema, ...syntax, types };
 }
 
 /** Picks the message type to decode as, reporting a problem if that is not possible */
@@ -167,20 +205,23 @@ export function interpretMessage(
         const fieldPath = [...path, number];
         let def = type?.fields.get(number);
         if (!def && type) {
-            ctx.problems.push({
-                code: 'unknown-field',
-                message: `Field ${number} is not defined in ${type.fullName}`,
-                offset: occurrences[0]!.range.start,
-                path: fieldPath
-            });
+            // Fields of a type the schema never defined are expected to be unknown
+            if (!ctx.missingTypes.has(type.fullName)) {
+                ctx.problems.push({
+                    code: 'unknown-field',
+                    message: `Field ${number} is not defined in ${type.fullName}`,
+                    offset: occurrences[0]!.range.start,
+                    path: fieldPath
+                });
+            }
             def = ctx.extensions.get(type.fullName)?.get(number);
         }
         if (!def) {
-            // Only reached for fields of types the schema does not define at all
+            // Only reached when there is no type at all to collect unknown fields under
             const inferrer = new Inferrer(ctx.types, ctx.recursionLimit, ctx.inferred, ctx.problems);
             def = inferrer.inferField(number, [occurrences], type?.fullName ?? 'Unknown', depth, path);
         }
-        out.set(number, interpretField(occurrences, def, ctx, fieldPath, depth));
+        out.set(number, interpretField(occurrences, def, ctx, fieldPath, depth, type?.fullName));
     }
 
     return { type: type?.fullName, fields: out };
@@ -191,9 +232,10 @@ function interpretField(
     def: FieldDef,
     ctx: InterpretContext,
     path: readonly number[],
-    depth: number
+    depth: number,
+    scope: string | undefined
 ): Field {
-    const values = occurrences.flatMap(occ => interpretOccurrence(occ, def, ctx, path, depth));
+    const values = occurrences.flatMap(occ => interpretOccurrence(occ, def, ctx, path, depth, scope));
 
     // Alternatives are only wanted when someone looks at them, and computing them
     // for every field roughly doubles the work, so they are produced on first access
@@ -205,7 +247,7 @@ function interpretField(
         values,
         raw: occurrences,
         get alternatives() {
-            alternatives ??= interpretAlternatives(occurrences, def, ctx, path, depth);
+            alternatives ??= interpretAlternatives(occurrences, def, ctx, path, depth, scope);
             return alternatives;
         }
     };
@@ -216,7 +258,8 @@ function interpretAlternatives(
     def: FieldDef,
     ctx: InterpretContext,
     path: readonly number[],
-    depth: number
+    depth: number,
+    scope: string | undefined
 ): Alternative[] {
     return (def.inferred?.alternatives ?? []).map(alt => {
         const altDef = fieldDef({
@@ -230,7 +273,7 @@ function interpretAlternatives(
         return {
             type: alt.type,
             packed: alt.packed,
-            values: occurrences.flatMap(occ => interpretOccurrence(occ, altDef, scratch, path, depth))
+            values: occurrences.flatMap(occ => interpretOccurrence(occ, altDef, scratch, path, depth, scope))
         };
     });
 }
@@ -240,7 +283,8 @@ function interpretOccurrence(
     def: FieldDef,
     ctx: InterpretContext,
     path: readonly number[],
-    depth: number
+    depth: number,
+    scope: string | undefined
 ): Value[] {
     const type = def.type;
 
@@ -258,12 +302,13 @@ function interpretOccurrence(
         case 'len':
             if (type.kind === 'scalar' && type.scalar === 'string') return [fromString(occ, def, ctx, path)];
             if (type.kind === 'scalar' && type.scalar === 'bytes') return [{ kind: 'bytes', value: occ.bytes }];
-            if (type.kind === 'message' || type.kind === 'map') return [nestedMessage(occ, type, ctx, path, depth)];
+            if (type.kind === 'message' || type.kind === 'map') return [nestedMessage(occ, def, type, ctx, path, depth, scope)];
             if (def.cardinality === 'repeated' && isPackable(type)) return fromPacked(occ, def, ctx, path);
             break;
         case 'group':
             if (type.kind === 'message' || type.kind === 'map') {
-                return [{ kind: 'message', value: interpretMessage(occ.fields, resolveMessageType(type, ctx, path), ctx, path, depth + 1) }];
+                const nestedType = resolveMessageType(type, ctx, path, mapEntryName(scope, def));
+                return [{ kind: 'message', value: interpretMessage(occ.fields, nestedType, ctx, path, depth + 1) }];
             }
             break;
         case 'egroup':
@@ -297,10 +342,12 @@ function fromString(occ: WireLen, def: FieldDef, ctx: InterpretContext, path: re
 
 function nestedMessage(
     occ: WireLen,
+    def: FieldDef,
     type: FieldType & { kind: 'message' | 'map' },
     ctx: InterpretContext,
     path: readonly number[],
-    depth: number
+    depth: number,
+    scope: string | undefined
 ): Value {
     if (depth >= ctx.recursionLimit) {
         ctx.problems.push({
@@ -322,19 +369,26 @@ function nestedMessage(
             path
         });
     }
-    return { kind: 'message', value: interpretMessage(wire.fields, resolveMessageType(type, ctx, path), ctx, path, depth + 1) };
+    const nestedType = resolveMessageType(type, ctx, path, mapEntryName(scope, def));
+    return { kind: 'message', value: interpretMessage(wire.fields, nestedType, ctx, path, depth + 1) };
+}
+
+/** A distinct name per map field for its synthetic entry type, so unknown fields in different maps are kept apart */
+function mapEntryName(scope: string | undefined, def: FieldDef): string {
+    return `${scope ?? 'Map'}.${def.name}Entry`;
 }
 
 function resolveMessageType(
     type: FieldType & { kind: 'message' | 'map' },
     ctx: InterpretContext,
-    path: readonly number[]
-): MessageType | undefined {
+    path: readonly number[],
+    entryName: string
+): MessageType {
     if (type.kind === 'map') {
         return {
             kind: 'message',
-            name: 'MapEntry',
-            fullName: 'MapEntry',
+            name: entryName.slice(entryName.lastIndexOf('.') + 1),
+            fullName: entryName,
             fields: new Map([
                 [1, fieldDef({ number: 1, name: 'key', type: scalar(type.key) })],
                 [2, fieldDef({ number: 2, name: 'value', type: type.value })]
@@ -346,14 +400,29 @@ function resolveMessageType(
     }
     const resolved = ctx.types.get(type.name);
     if (resolved?.kind === 'message') return resolved;
-    ctx.problems.push({
-        code: 'unknown-type',
-        message: resolved
-            ? `${type.name} is an enum, not a message`
-            : `Message type ${type.name} is not defined; decoding heuristically`,
-        path
-    });
-    return undefined;
+
+    // A type the schema refers to but does not define: stand in with an empty
+    // type of that name, so that its fields are inferred together like any
+    // other unknown fields and the type can be reconstructed from them
+    if (!ctx.missingTypes.has(type.name)) {
+        ctx.missingTypes.add(type.name);
+        ctx.problems.push({
+            code: 'unknown-type',
+            message: resolved
+                ? `${type.name} is an enum, not a message; decoding its values heuristically`
+                : `Message type ${type.name} is not defined; decoding its values heuristically`,
+            path
+        });
+    }
+    return {
+        kind: 'message',
+        name: type.name.slice(type.name.lastIndexOf('.') + 1),
+        fullName: type.name,
+        fields: new Map(),
+        oneofs: [],
+        mapEntry: false,
+        messageSet: false
+    };
 }
 
 function enumValue(typeName: string, raw: bigint, ctx: InterpretContext): Value {

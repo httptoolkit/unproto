@@ -1,9 +1,9 @@
 import { decodeWire, type WireMessage } from './wire.ts';
 import type { Problem } from './problem.ts';
-import type { FieldDef, NamedType, Schema } from './schema.ts';
+import type { NamedType, Schema } from './schema.ts';
 import type { AnalysisCache } from './heuristics.ts';
 import { Inferrer } from './infer.ts';
-import { extendSchema, findMessageType, inferUnknownFields, type InterpretContext } from './interpret.ts';
+import { createContext, extendSchema, findMessageType, inferUnknownFields } from './interpret.ts';
 
 export interface SchemaInferrerOptions {
     /** Name given to the root message type when inferring from scratch. Defaults to 'Message'. */
@@ -77,13 +77,7 @@ export class SchemaInferrer {
 
     private extend(base: Schema, problems: Problem[]): Schema {
         const type = findMessageType(base, this.options.type, problems);
-        const ctx: InterpretContext = {
-            types: new Map(base.types),
-            inferred: new Set(),
-            extensions: new Map<string, Map<number, FieldDef>>(),
-            problems,
-            recursionLimit: this.recursionLimit
-        };
+        const ctx = createContext(new Map(base.types), new Set(), problems, this.recursionLimit);
         if (type) inferUnknownFields(this.samples.map(s => s.fields), type, ctx, this.cache);
         return extendSchema(base, ctx);
     }

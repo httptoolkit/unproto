@@ -1,5 +1,5 @@
 import { expect } from 'chai';
-import { SchemaInferrer, inferSchema, schema, messageType, fieldDef, scalar, type MessageType } from '../src/index.ts';
+import { SchemaInferrer, inferSchema, decode, schema, messageType, fieldDef, scalar, type MessageType } from '../src/index.ts';
 import { hex, concat, lenField, varintField, expectProblem } from './test-util.ts';
 
 function message(s: ReturnType<typeof inferSchema>, name: string): MessageType {
@@ -65,6 +65,33 @@ describe('SchemaInferrer', () => {
 
         expect((base.types.get('app.Person') as MessageType).fields.has(2)).to.equal(false);
         expect(base.types.has('app.Person.Field3')).to.equal(false);
+    });
+
+    it('counts every instance of the containing type when extending a base schema', () => {
+        const base = schema([messageType('Person', [fieldDef({ number: 1, name: 'id', type: scalar('int32') })])]);
+        const inferrer = new SchemaInferrer({ base })
+            .add(concat(varintField(1, 1), lenField(2, 'Jane')))
+            .add(varintField(1, 2))
+            .add(varintField(1, 3));
+        expect(message(inferrer.schema(), 'Person').fields.get(2)!.inferred).to.deep.include({ presentIn: 1, samples: 3 });
+    });
+
+    it('reports and reconstructs a type the base schema refers to but lacks', () => {
+        const base = schema([messageType('T', [fieldDef({ number: 1, name: 'rows', type: { kind: 'message', name: 'Row' }, cardinality: 'repeated' })])]);
+        const inferrer = new SchemaInferrer({ base, type: 'T' })
+            .add(lenField(1, varintField(1, 5)))
+            .add(lenField(1, concat(varintField(1, 6), lenField(2, 'x'))));
+        expect(inferrer.problems().map(p => p.code)).to.deep.equal(['unknown-type']);
+        const row = message(inferrer.schema(), 'Row');
+        expect([...row.fields.keys()]).to.deep.equal([1, 2]);
+        expect(row.fields.get(2)!.inferred).to.deep.include({ presentIn: 1, samples: 2 });
+    });
+
+    it('switches an extended proto3 schema to editions when a group is inferred', () => {
+        const base = schema([messageType('T', [])]);
+        const extended = new SchemaInferrer({ base }).add(hex('0b 08 01 0c')).schema();
+        expect(extended.syntax).to.equal('editions');
+        expect(decode(hex('0b 08 01 0c'), { schema: base, type: 'T' }).schema.syntax).to.equal('editions');
     });
 
     it('reports wire problems in samples and a missing base type', () => {

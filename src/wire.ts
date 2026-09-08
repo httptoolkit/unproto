@@ -136,13 +136,17 @@ interface SmallVarint {
  */
 export function readSmallVarint(input: Uint8Array, pos: number, end: number): SmallVarint | 'truncated' | 'too-long' | 'too-large' {
     let value = 0;
+    let tooLarge = false;
     for (let i = 0; i < 10; i++) {
         if (pos + i >= end) return 'truncated';
         const b = input[pos + i]!;
         const payload = b & 0x7f;
         if (i < 7) value += payload * VARINT_SHIFT[i]!;
-        else if (payload !== 0) return 'too-large';
-        if (b < 0x80) return { value, length: i + 1, nonCanonical: i > 0 && payload === 0 };
+        else if (payload !== 0) tooLarge = true;
+        if (b < 0x80) {
+            if (tooLarge) return 'too-large';
+            return { value, length: i + 1, nonCanonical: i > 0 && payload === 0 };
+        }
     }
     return 'too-long';
 }

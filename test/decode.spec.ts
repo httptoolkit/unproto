@@ -206,6 +206,20 @@ describe('decode without a schema', () => {
             .to.deep.equal([{ kind: 'double', value: 1.5 }, { kind: 'double', value: 2.5 }]);
     });
 
+    it('keeps genuine packed doubles when one low word happens to look like a float', () => {
+        const doubles = (values: number[]) => {
+            const bytes = new Uint8Array(values.length * 8);
+            values.forEach((v, i) => new DataView(bytes.buffer).setFloat64(i * 8, v, true));
+            return lenField(1, bytes);
+        };
+        expect(field(doubles([54.35, 406.25]), 1).values.map(v => v.kind === 'double' && v.value)).to.deep.equal([54.35, 406.25]);
+        expect(field(doubles([2.5, 0.3, 7.25]), 1).values.map(v => v.kind === 'double' && v.value)).to.deep.equal([2.5, 0.3, 7.25]);
+    });
+
+    it('reads a NUL followed by ASCII bytes as packed varints, not text', () => {
+        expect(toObject(decode(hex('0a 05 00 64 64 64 64')).message)).to.deep.equal({ '1': [0n, 100n, 100n, 100n, 100n] });
+    });
+
     it('accepts wide values in packed varint lists', () => {
         const input = lenField(7, concat(varint(2n ** 53n + 1n), varint(0), varint(2n ** 53n + 1n), varint(-(2n ** 53n + 1n))));
         expect(field(input, 7).values.map(v => v.kind === 'int64' && v.value)).to.deep.equal([2n ** 53n + 1n, 0n, 2n ** 53n + 1n, -(2n ** 53n + 1n)]);
@@ -404,6 +418,9 @@ describe('decode without a schema', () => {
         const leaf = decode(hex('0a 07 12 05 68 65 6c 6c 6f'), { recursionLimit: 1 });
         expectNoProblems(leaf.problems);
         expect(toObject(leaf.message)).to.deep.equal({ '1': { '2': 'hello' } });
+
+        // A string leaf that happens to parse as protobuf is still a string, so nothing was lost
+        expectNoProblems(decode(lenField(1, lenField(1, 'mabcd')), { recursionLimit: 1 }).problems);
 
         const deeper = decode(hex('0a 04 0a 02 08 01'), { recursionLimit: 1 });
         const problem = expectProblem(deeper.problems, 'recursion-limit', 2);
@@ -605,6 +622,38 @@ describe('decode with a schema', () => {
         const extended = result.schema.types.get('test.Person') as MessageType;
         expect(extended.fields.get(99)!.type).to.deep.equal(scalar('int64'));
         expect((testSchema.types.get('test.Person') as MessageType).fields.has(99)).to.equal(false);
+    });
+
+    it('keeps unknown fields of different map entries apart', () => {
+        const maps = schema([messageType('M', [
+            fieldDef({ number: 1, name: 'a', type: { kind: 'map', key: 'string', value: scalar('int32') }, cardinality: 'repeated' }),
+            fieldDef({ number: 2, name: 'b', type: { kind: 'map', key: 'string', value: scalar('int32') }, cardinality: 'repeated' })
+        ])]);
+        const input = concat(
+            lenField(1, concat(lenField(1, 'k'), varintField(2, 1), lenField(3, 'hello'))),
+            lenField(2, concat(lenField(1, 'k'), varintField(2, 1), varintField(3, 7)))
+        );
+        const result = decode(input, { schema: maps, type: 'M' });
+        expect(toObject(result.message)).to.deep.equal({
+            a: [{ key: 'k', value: 1n, '3': 'hello' }],
+            b: [{ key: 'k', value: 1n, '3': 7n }]
+        });
+        expect(result.schema.types.has('MapEntry')).to.equal(false);
+    });
+
+    it('reconstructs a referenced type the schema does not define, from all its instances', () => {
+        const rows = schema([messageType('T', [fieldDef({ number: 1, name: 'rows', type: { kind: 'message', name: 'Row' }, cardinality: 'repeated' })])]);
+        const row = lenField(1, concat(varintField(1, 5), lenField(2, varintField(1, 1))));
+        const result = decode(concat(row, row, row), { schema: rows, type: 'T' });
+        expect(result.problems.map(p => p.code)).to.deep.equal(['unknown-type']);
+        expect(toObject(result.message)).to.deep.equal({ rows: [{ '1': 5n, '2': { '1': 1n } }, { '1': 5n, '2': { '1': 1n } }, { '1': 5n, '2': { '1': 1n } }] });
+        expect([...result.schema.types.keys()]).to.deep.equal(['T', 'Row.Field2', 'Row']);
+        expect((result.schema.types.get('Row') as MessageType).fields.get(1)!.inferred).to.deep.include({ presentIn: 3, samples: 3 });
+
+        const many = concat(...Array.from({ length: 3000 }, () => row));
+        const start = performance.now();
+        decode(many, { schema: rows, type: 'T' });
+        expect(performance.now() - start).to.be.lessThan(2000);
     });
 
     it('never lets an inferred type replace a supplied one with the same name', () => {
