@@ -64,8 +64,8 @@ jobs:
       - name: Publish to npm
         run: |
           if [ "${{ steps.version-check.outputs.is_prerelease }}" == "true" ]; then
-            npm publish --provenance --tag test
+            npm stage publish --provenance --tag test
             npm dist-tag rm unproto test --silent
           else
-            npm publish --provenance
+            npm stage publish --provenance
           fi
