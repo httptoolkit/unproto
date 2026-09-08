@@ -13,11 +13,12 @@ jobs:
       matrix:
         node-version: [22.x, 24.x, latest]
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
         with:
           node-version: ${{ matrix.node-version }}
           cache: npm
+          cache-dependency-path: 'package.json'
           check-latest: true
       - run: npm install
       - run: npm run build
@@ -35,12 +36,13 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
         with:
           node-version: 24.x
           registry-url: 'https://registry.npmjs.org'
           cache: npm
+          cache-dependency-path: 'package.json'
       # Trusted publishing (tokenless OIDC) needs npm >= 11.5.1
       - run: npm install -g npm@^11
       - run: npm install
