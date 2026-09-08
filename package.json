@@ -1,6 +1,6 @@
 {
   "name": "unproto",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "With no schema, decode protobuf, infer a schema, test it, and re-encode again to reverse engineer protobuf from real HTTP traffic",
   "keywords": [
     "protobuf",
