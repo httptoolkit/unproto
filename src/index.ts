@@ -42,17 +42,17 @@ export {
 export type { Alternative, Field, IntKind, Message, Value } from './values.ts';
 export { SchemaInferrer, inferSchema, type SchemaInferrerOptions } from './schema-inferrer.ts';
 export { printProto, type PrintProtoOptions } from './print.ts';
+export { decode, type DecodeOptions, type DecodeResult } from './decode.ts';
+export { toObject, type PlainObject, type PlainValue } from './object.ts';
+export { isValidProtobuf } from './validate.ts';
 export { parseProto, type ParseProtoOptions, type ParseProtoResult } from './proto-parser.ts';
-export { WELL_KNOWN_TYPES } from './well-known.ts';
+export { WELL_KNOWN_TYPES, isWellKnownImport, wellKnownTypesFor } from './well-known.ts';
 export {
     schemaFromDescriptorSet,
     DESCRIPTOR_SCHEMA,
     type DescriptorSetOptions,
     type DescriptorSetResult
 } from './descriptor.ts';
-export { decode, type DecodeOptions, type DecodeResult } from './decode.ts';
-export { toObject, type PlainObject, type PlainValue, type ToObjectOptions } from './object.ts';
-export { isValidProtobuf } from './validate.ts';
 export {
     encodeMessage,
     encodeObject,

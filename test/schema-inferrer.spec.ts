@@ -1,5 +1,14 @@
 import { expect } from 'chai';
-import { SchemaInferrer, inferSchema, decode, schema, messageType, fieldDef, scalar, type MessageType } from '../src/index.ts';
+import {
+    SchemaInferrer,
+    inferSchema,
+    decode,
+    schema,
+    messageType,
+    fieldDef,
+    scalar,
+    type MessageType
+} from '../src/index.ts';
 import { hex, concat, lenField, varintField, expectProblem } from './test-util.ts';
 
 function message(s: ReturnType<typeof inferSchema>, name: string): MessageType {

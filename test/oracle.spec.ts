@@ -1,6 +1,13 @@
 import { expect } from 'chai';
 import protobuf from 'protobufjs';
-import { decode, toObject, schema, messageType, fieldDef, scalar } from '../src/index.ts';
+import {
+    decode,
+    toObject,
+    schema,
+    messageType,
+    fieldDef,
+    scalar
+} from '../src/index.ts';
 import { expectNoProblems } from './test-util.ts';
 
 // Cross-checks against protobufjs as an independent encoder
@@ -106,7 +113,7 @@ describe('decoding protobufjs output', () => {
             h: new Uint8Array([0xff, 0x00, 0x01]),
             i: -3n,
             j: 1234n,
-            m: [{ key: 'key', value: 7n }],
+            m: { key: 7n },
             s: ['one', 'two'],
             big: 9007199254740993n,
             u: 4294967295n,

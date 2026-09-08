@@ -486,7 +486,7 @@ describe('decode with a schema', () => {
             address: { zip: -1n },
             kind: 'KIND_B',
             delta: -2n,
-            attrs: [{ key: 'a', value: 5n }],
+            attrs: { a: 5n },
             score: 1,
             active: true,
             kinds: ['KIND_B', 7n]
@@ -635,10 +635,16 @@ describe('decode with a schema', () => {
             lenField(2, concat(lenField(1, 'k'), varintField(2, 1), varintField(3, 7)))
         );
         const result = decode(input, { schema: maps, type: 'M' });
-        expect(toObject(result.message)).to.deep.equal({
-            a: [{ key: 'k', value: 1n, '3': 'hello' }],
-            b: [{ key: 'k', value: 1n, '3': 7n }]
-        });
+        expect(toObject(result.message)).to.deep.equal({ a: { k: 1n }, b: { k: 1n } });
+
+        // Flattening drops what a map cannot express, so the entries themselves carry it
+        const unknownIn = (number: number) => {
+            const entry = result.message.fields.get(number)!.values[0]!;
+            expect(entry.kind).to.equal('message');
+            return (entry as Value & { kind: 'message' }).value.fields.get(3)!.values[0];
+        };
+        expect(unknownIn(1)).to.deep.equal({ kind: 'string', value: 'hello' });
+        expect(unknownIn(2)).to.deep.equal({ kind: 'int64', value: 7n });
         expect(result.schema.types.has('MapEntry')).to.equal(false);
     });
 
@@ -664,7 +670,7 @@ describe('decode with a schema', () => {
         // One entry carrying an unknown field 3, whose payload is itself a message
         const input = lenField(1, concat(lenField(1, 'k'), varintField(2, 1), lenField(3, varintField(1, 7))));
         const result = decode(input, { schema: maps, type: 'M' });
-        expect(toObject(result.message)).to.deep.equal({ a: [{ key: 'k', value: 1n, '3': { '1': 7n } }] });
+        expect(toObject(result.message)).to.deep.equal({ a: { k: 1n } });
 
         // The inferred field belongs to the entry type, and nothing is left dangling
         const entry = result.schema.types.get('M.aEntry') as MessageType;

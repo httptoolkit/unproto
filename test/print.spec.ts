@@ -1,7 +1,16 @@
 import { expect } from 'chai';
 import { readFile } from 'node:fs/promises';
 import protobuf from 'protobufjs';
-import { decode, printProto, inferSchema, schema, messageType, enumType, fieldDef, scalar } from '../src/index.ts';
+import {
+    decode,
+    printProto,
+    inferSchema,
+    schema,
+    messageType,
+    enumType,
+    fieldDef,
+    scalar
+} from '../src/index.ts';
 import { hex, concat, lenField, varintField } from './test-util.ts';
 
 function parse(text: string): protobuf.Root {

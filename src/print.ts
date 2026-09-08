@@ -11,7 +11,6 @@ import {
     type Schema
 } from './schema.ts';
 import { MAX_FIELD_NUMBER } from './wire.ts';
-import { WELL_KNOWN_TYPES } from './well-known.ts';
 
 export interface PrintProtoOptions {
     /** Comment lines placed at the top of the file */
@@ -160,7 +159,7 @@ function childrenByParent(schema: Schema): Map<string, NamedType[]> {
 /** Types that belong to an imported file are referenced, not redeclared */
 function isImported(schema: Schema, type: NamedType): boolean {
     const pkg = schema.package;
-    if (WELL_KNOWN_TYPES.has(type.fullName)) return pkg !== 'google.protobuf';
+    if (type.fullName.startsWith('google.protobuf.')) return pkg !== 'google.protobuf';
     return pkg !== undefined && !type.fullName.startsWith(`${pkg}.`);
 }
 

@@ -2,6 +2,7 @@ import type { Problem } from './problem.ts';
 import { MAX_FIELD_NUMBER } from './wire.ts';
 import {
     isPackable,
+    resolveTypeName,
     scalar,
     type Cardinality,
     type EnumValue,
@@ -315,7 +316,13 @@ class Parser {
     }
 
     private report(code: Problem['code'], message: string, offset: number, line: number): void {
-        this.problems.push({ code, message: `${this.fileName}:${line}: ${message}`, offset });
+        this.problems.push({ code, message: `${this.fileName}:${line}:${this.columnAt(offset)}: ${message}`, offset });
+    }
+
+    /** The 1-based column of an offset, for pointing at the problem in an editor */
+    private columnAt(offset: number): number {
+        const lineStart = this.source.lastIndexOf('\n', offset - 1);
+        return offset - lineStart;
     }
 
     /** Skips to the end of the current statement or block, so one bad declaration does not lose the rest */
@@ -988,7 +995,7 @@ class Parser {
         if (!this.syntaxSeen) {
             this.problems.push({
                 code: 'unsupported',
-                message: `${this.fileName}: no syntax or edition statement; reading the file as proto2`,
+                message: `${this.fileName}:1:1: no syntax or edition statement; reading the file as proto2`,
                 offset: 0
             });
         }
@@ -1042,11 +1049,7 @@ class Parser {
                     : features;
                 const field = this.buildField(raw, declaration.fullName, scopeFeatures, declared, messages, enums);
                 if (fields.has(field.number)) {
-                    this.problems.push({
-                        code: 'duplicate-name',
-                        message: `${this.fileName}: ${declaration.fullName} has two fields numbered ${field.number}`,
-                        offset: raw.offset
-                    });
+                    this.report('duplicate-name', `${declaration.fullName} has two fields numbered ${field.number}`, raw.offset, this.lineAt(raw.offset));
                 }
                 fields.set(field.number, field);
             }
@@ -1134,7 +1137,7 @@ class Parser {
             const [keyText, valueText] = splitMap(text);
             const key = SCALAR_TYPES.has(keyText) ? keyText as ScalarType : 'string';
             if (!SCALAR_TYPES.has(keyText)) {
-                this.problems.push({ code: 'unsupported', message: `${this.fileName}: map key type '${keyText}' is not a scalar`, offset });
+                this.report('unsupported', `map key type '${keyText}' is not a scalar`, offset, this.lineAt(offset));
             }
             return { kind: 'map', key, value: this.resolveType(valueText, scope, declared, messages, enums, offset) };
         }
@@ -1148,40 +1151,23 @@ class Parser {
         return { kind: 'message', name: resolved };
     }
 
-    /**
-     * Resolves a written type name the way protoc does: the first component
-     * is looked up in the innermost scope and then each enclosing one, and
-     * the rest of the name must exist under whichever scope matched.
-     */
     private resolveName(text: string, scope: string, declared: ReadonlySet<string>, offset: number): string | undefined {
-        if (text.startsWith('.')) {
-            const full = text.slice(1);
-            if (declared.has(full)) return full;
-            this.reportUnresolved(text, offset);
-            return undefined;
-        }
-        const first = text.split('.')[0]!;
-        let current = scope;
-        for (;;) {
-            const prefix = current === '' ? '' : `${current}.`;
-            if (declared.has(prefix + first) || hasPrefix(declared, prefix + first)) {
-                const full = prefix + text;
-                if (declared.has(full)) return full;
-                break;
-            }
-            if (current === '') break;
-            current = parentOf(current);
-        }
-        this.reportUnresolved(text, offset);
-        return undefined;
+        const resolved = resolveTypeName(text, scope, declared);
+        if (resolved === undefined) this.reportUnresolved(text, offset);
+        return resolved;
     }
 
     private reportUnresolved(text: string, offset: number): void {
-        this.problems.push({
-            code: 'unresolved-type',
-            message: `${this.fileName}: type '${text}' is not defined in this file or a bundled import`,
-            offset
-        });
+        this.report('unresolved-type', `type '${text}' is not defined in this file or a bundled import`, offset, this.lineAt(offset));
+    }
+
+    /** The 1-based line of an offset, for problems raised after tokenizing */
+    private lineAt(offset: number): number {
+        let line = 1;
+        for (let i = 0; i < offset && i < this.source.length; i++) {
+            if (this.source[i] === '\n') line++;
+        }
+        return line;
     }
 }
 
@@ -1198,13 +1184,6 @@ function parentOf(fullName: string): string {
 
 function stripDot(name: string): string {
     return name.startsWith('.') ? name.slice(1) : name;
-}
-
-function hasPrefix(names: ReadonlySet<string>, prefix: string): boolean {
-    for (const name of names) {
-        if (name.startsWith(`${prefix}.`)) return true;
-    }
-    return false;
 }
 
 function splitMap(text: string): [string, string] {

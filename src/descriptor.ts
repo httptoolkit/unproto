@@ -4,6 +4,7 @@ import {
     fieldDef,
     isPackable,
     messageType,
+    resolveTypeName,
     scalar,
     schema,
     type Cardinality,
@@ -202,7 +203,8 @@ export function schemaFromDescriptorSet(bytes: Uint8Array, options: DescriptorSe
     const types = new Map<string, NamedType>();
     const services: ServiceDecl[] = [];
     const extensions: ExtensionDecl[] = [];
-    const reader = new DescriptorReader(types, services, extensions, problems);
+    // Type references may be relative, so every declared name is collected first
+    const reader = new DescriptorReader(types, services, extensions, problems, declaredNames(files));
 
     let primary = files[files.length - 1]!;
     if (options.file !== undefined) {
@@ -235,19 +237,48 @@ function fileEdition(file: Message): string {
     return str(file, 12) === 'proto3' ? 'proto3' : 'proto2';
 }
 
+/** Every fully-qualified message and enum name the set declares */
+function declaredNames(files: readonly Message[]): Set<string> {
+    const names = new Set<string>();
+    const addMessage = (message: Message, scope: string): void => {
+        const fullName = join(scope, str(message, 1) ?? '');
+        names.add(fullName);
+        for (const nested of subMessages(message, 3)) addMessage(nested, fullName);
+        for (const enumeration of subMessages(message, 4)) names.add(join(fullName, str(enumeration, 1) ?? ''));
+    };
+    for (const file of files) {
+        const pkg = str(file, 2) ?? '';
+        for (const message of subMessages(file, 4)) addMessage(message, pkg);
+        for (const enumeration of subMessages(file, 5)) names.add(join(pkg, str(enumeration, 1) ?? ''));
+    }
+    return names;
+}
+
+function join(scope: string, name: string): string {
+    return scope === '' ? name : `${scope}.${name}`;
+}
+
 class DescriptorReader {
     private readonly types: Map<string, NamedType>;
     private readonly services: ServiceDecl[];
     private readonly extensions: ExtensionDecl[];
     private readonly problems: Problem[];
+    private readonly declared: ReadonlySet<string>;
     /** Map entry types that have been folded into a map field, so are no longer needed */
     readonly foldedMapEntries = new Set<string>();
 
-    constructor(types: Map<string, NamedType>, services: ServiceDecl[], extensions: ExtensionDecl[], problems: Problem[]) {
+    constructor(
+        types: Map<string, NamedType>,
+        services: ServiceDecl[],
+        extensions: ExtensionDecl[],
+        problems: Problem[],
+        declared: ReadonlySet<string>
+    ) {
         this.types = types;
         this.services = services;
         this.extensions = extensions;
         this.problems = problems;
+        this.declared = declared;
     }
 
     readFile(file: Message): void {
@@ -260,14 +291,14 @@ class DescriptorReader {
         for (const service of subMessages(file, 6)) this.readService(service, pkg);
         for (const extension of subMessages(file, 7)) {
             const field = this.readField(extension, pkg, edition, features, []);
-            const extendee = qualify(str(extension, 2) ?? '');
+            const extendee = this.resolve(str(extension, 2) ?? '', pkg, 'extendee');
             if (field) this.extensions.push({ extendee, field });
         }
     }
 
     private readMessage(message: Message, scope: string, edition: string, inherited: ResolvedFeatures): void {
         const name = str(message, 1) ?? '';
-        const fullName = scope === '' ? name : `${scope}.${name}`;
+        const fullName = join(scope, name);
         const options = subMessage(message, 7);
         const features = mergeFeatures(inherited, readFeatures(options));
 
@@ -315,7 +346,7 @@ class DescriptorReader {
         const name = str(descriptor, 1) ?? '';
         const number = num(descriptor, 3);
         if (number === undefined) {
-            this.problems.push({ code: 'invalid-field-number', message: `Field ${scope}.${name} has no number` });
+            this.problems.push({ code: 'invalid-field-number', message: `Field ${join(scope, name)} has no number` });
             return undefined;
         }
 
@@ -327,6 +358,7 @@ class DescriptorReader {
         const repeated = label === LABEL_REPEATED;
 
         let type = this.fieldType(typeNumber, typeName, scope, name);
+
         let cardinality: Cardinality = repeated ? 'repeated' : 'optional';
         if (!repeated && (label === LABEL_REQUIRED || features.fieldPresence === 'LEGACY_REQUIRED')) {
             cardinality = 'required';
@@ -376,20 +408,37 @@ class DescriptorReader {
     }
 
     private fieldType(typeNumber: number | undefined, typeName: string | undefined, scope: string, field: string): FieldType {
-        if (typeNumber === TYPE_MESSAGE || typeNumber === TYPE_GROUP) return { kind: 'message', name: qualify(typeName ?? '') };
-        if (typeNumber === TYPE_ENUM) return { kind: 'enum', name: qualify(typeName ?? '') };
+        if (typeNumber === TYPE_MESSAGE || typeNumber === TYPE_GROUP || typeNumber === TYPE_ENUM) {
+            const kind = typeNumber === TYPE_ENUM ? 'enum' as const : 'message' as const;
+            return { kind, name: this.resolve(typeName ?? '', scope, field) };
+        }
         const named = typeNumber === undefined ? undefined : TYPE_NAMES[typeNumber];
         if (named) return scalar(named);
         this.problems.push({
             code: 'unknown-type',
-            message: `Field ${scope}.${field} has unknown type number ${typeNumber}; reading it as bytes`
+            message: `Field ${join(scope, field)} has unknown type number ${typeNumber}; reading it as bytes`
         });
         return scalar('bytes');
     }
 
+    /**
+     * Descriptor type references are usually fully qualified with a leading
+     * dot, but the format allows relative names resolved with C++ scoping
+     * rules, and some producers emit those.
+     */
+    private resolve(typeName: string, scope: string, field: string): string {
+        const resolved = resolveTypeName(typeName, scope, this.declared);
+        if (resolved !== undefined) return resolved;
+        this.problems.push({
+            code: 'unresolved-type',
+            message: `Field ${join(scope, field)} refers to type '${typeName}', which the descriptor set does not define`
+        });
+        return qualify(typeName);
+    }
+
     private readEnum(descriptor: Message, scope: string, inherited: ResolvedFeatures): void {
         const name = str(descriptor, 1) ?? '';
-        const fullName = scope === '' ? name : `${scope}.${name}`;
+        const fullName = join(scope, name);
         const features = mergeFeatures(inherited, readFeatures(subMessage(descriptor, 3)));
         const values: EnumValue[] = [];
         for (const value of subMessages(descriptor, 2)) {
@@ -406,12 +455,12 @@ class DescriptorReader {
         const name = str(descriptor, 1) ?? '';
         const methods: MethodDecl[] = subMessages(descriptor, 2).map(method => ({
             name: str(method, 1) ?? '',
-            inputType: qualify(str(method, 2) ?? ''),
-            outputType: qualify(str(method, 3) ?? ''),
+            inputType: this.resolve(str(method, 2) ?? '', scope, 'input_type'),
+            outputType: this.resolve(str(method, 3) ?? '', scope, 'output_type'),
             clientStreaming: bool(method, 5) === true,
             serverStreaming: bool(method, 6) === true
         }));
-        this.services.push({ name, fullName: scope === '' ? name : `${scope}.${name}`, methods });
+        this.services.push({ name, fullName: join(scope, name), methods });
     }
 }
 

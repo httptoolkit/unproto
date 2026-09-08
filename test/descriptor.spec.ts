@@ -2,14 +2,16 @@ import { expect } from 'chai';
 import { readFile } from 'node:fs/promises';
 import protobuf from 'protobufjs';
 import {
-    schemaFromDescriptorSet,
-    parseProto,
     printProto,
     decode,
     toObject,
     type MessageType,
     type EnumType,
-    type Schema
+    type Schema,
+    schemaFromDescriptorSet,
+    DESCRIPTOR_SCHEMA,
+    encodeObject,
+    parseProto
 } from '../src/index.ts';
 import { hex } from './test-util.ts';
 
@@ -115,7 +117,7 @@ describe('schemaFromDescriptorSet', () => {
         expect(toObject(result.message)).to.deep.equal({
             plain: 7n, opt: 0n, packed: [1n, 2n, 3n], loose: [4n, 5n], text: 'hi',
             blob: new Uint8Array([1, 2]), kind: 'K_ONE', nested: { d: 1.5 },
-            counts: [{ key: 'a', value: 1n }], at: { seconds: 100n, nanos: 5n },
+            counts: { a: 1n }, at: { seconds: 100n, nanos: 5n },
             y: 'chosen', many: [{ d: 2.5 }]
         });
     });
@@ -128,6 +130,51 @@ describe('schemaFromDescriptorSet', () => {
         expect(fields.get(9)!.type).to.deep.equal({ kind: 'map', key: 'string', value: { kind: 'scalar', scalar: 'int32' } });
         expect(fields.get(11)!.oneof).to.equal('pick');
         expect(fields.get(2)!.presence).to.equal('explicit');
+    });
+
+    it('resolves relative type names, which the format allows and some producers emit', () => {
+        // Built with our own encoder, so the references are exactly as written here
+        const set = {
+            file: [{
+                name: 'rel.proto', package: 'rel', syntax: 'proto3',
+                message_type: [{
+                    name: 'Outer',
+                    field: [
+                        { name: 'inner', number: 1, label: 1, type: 11, type_name: 'Inner' },
+                        { name: 'kind', number: 2, label: 1, type: 14, type_name: 'Kind' },
+                        { name: 'many', number: 3, label: 3, type: 11, type_name: 'Outer.Inner' },
+                        { name: 'absolute', number: 4, label: 1, type: 11, type_name: '.rel.Outer.Inner' }
+                    ],
+                    nested_type: [{ name: 'Inner', field: [{ name: 's', number: 1, label: 1, type: 9 }] }],
+                    enum_type: [{ name: 'Kind', value: [{ name: 'K_A', number: 0 }, { name: 'K_B', number: 1 }] }]
+                }]
+            }]
+        };
+        const encoded = encodeObject(set, DESCRIPTOR_SCHEMA, 'google.protobuf.FileDescriptorSet');
+        expect(encoded.problems).to.deep.equal([]);
+
+        const { schema, problems } = schemaFromDescriptorSet(encoded.bytes);
+        expect(problems).to.deep.equal([]);
+        const fields = message(schema, 'rel.Outer').fields;
+        expect(fields.get(1)!.type).to.deep.equal({ kind: 'message', name: 'rel.Outer.Inner' });
+        expect(fields.get(2)!.type).to.deep.equal({ kind: 'enum', name: 'rel.Outer.Kind' });
+        expect(fields.get(3)!.type).to.deep.equal({ kind: 'message', name: 'rel.Outer.Inner' });
+        expect(fields.get(4)!.type).to.deep.equal({ kind: 'message', name: 'rel.Outer.Inner' });
+
+        const decoded = decode(hex('0a 03 0a 01 78 10 01'), { schema, type: 'rel.Outer' });
+        expect(decoded.problems).to.deep.equal([]);
+        expect(toObject(decoded.message)).to.deep.equal({ inner: { s: 'x' }, kind: 'K_B' });
+    });
+
+    it('reports a type reference nothing in the set defines', () => {
+        const set = {
+            file: [{
+                name: 'x.proto', package: 'x', syntax: 'proto3',
+                message_type: [{ name: 'M', field: [{ name: 'f', number: 1, label: 1, type: 11, type_name: 'Missing' }] }]
+            }]
+        };
+        const { problems } = schemaFromDescriptorSet(encodeObject(set, DESCRIPTOR_SCHEMA, 'google.protobuf.FileDescriptorSet').bytes);
+        expect(problems.map(p => p.code)).to.deep.equal(['unresolved-type']);
     });
 
     it('reports a descriptor set it cannot read', () => {

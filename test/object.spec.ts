@@ -1,5 +1,12 @@
 import { expect } from 'chai';
-import { decode, toObject, schema, messageType, fieldDef, scalar } from '../src/index.ts';
+import {
+    decode,
+    toObject,
+    schema,
+    messageType,
+    fieldDef,
+    scalar
+} from '../src/index.ts';
 import { hex, concat, lenField, varintField } from './test-util.ts';
 
 describe('toObject', () => {
@@ -17,15 +24,6 @@ describe('toObject', () => {
         expect(toObject(decode(input, { schema: named }).message)).to.deep.equal({ count: 5n, label: 'x', inner: { count: 1n } });
     });
 
-    it('can be forced to numbers or names', () => {
-        expect(toObject(decode(input, { schema: named }).message, { keys: 'number' })).to.deep.equal({ '1': 5n, '2': 'x', '3': { '1': 1n } });
-        expect(toObject(decode(input).message, { keys: 'name' })).to.deep.equal({ field_1: 5n, field_2: 'x', field_3: { field_1: 1n } });
-    });
-
-    it('applies a prefix to every key', () => {
-        expect(toObject(decode(input).message, { prefix: 'f' })).to.deep.equal({ f1: 5n, f2: 'x', f3: { f1: 1n } });
-    });
-
     it('produces JSON-friendly values with a bigint-aware replacer', () => {
         const object = toObject(decode(concat(input, lenField(4, hex('ff 00')))).message);
         const json = JSON.stringify(object, (_key, value: unknown) =>
@@ -33,6 +31,37 @@ describe('toObject', () => {
             : value instanceof Uint8Array ? `bytes(${value.length})`
             : value);
         expect(JSON.parse(json)).to.deep.equal({ '1': '5', '2': 'x', '3': { '1': '1' }, '4': 'bytes(2)' });
+    });
+
+    it('flattens map fields into plain objects', () => {
+        const maps = schema([messageType('M', [
+            fieldDef({ number: 1, name: 'counters', type: { kind: 'map', key: 'string', value: scalar('int32') }, cardinality: 'repeated' }),
+            fieldDef({ number: 2, name: 'byId', type: { kind: 'map', key: 'int32', value: scalar('string') }, cardinality: 'repeated' })
+        ])]);
+        const bytes = concat(
+            lenField(1, concat(lenField(1, 'logins'), varintField(2, 7))),
+            lenField(1, concat(lenField(1, 'posts'), varintField(2, 130))),
+            lenField(2, concat(varintField(1, 5), lenField(2, 'five')))
+        );
+        const result = decode(bytes, { schema: maps, type: 'M' });
+        expect(result.problems).to.deep.equal([]);
+        expect(toObject(result.message)).to.deep.equal({
+            counters: { logins: 7n, posts: 130n },
+            byId: { 5: 'five' }
+        });
+    });
+
+    it('uses type defaults for map entries missing a key or a value', () => {
+        const maps = schema([messageType('M', [
+            fieldDef({ number: 1, name: 'm', type: { kind: 'map', key: 'string', value: scalar('int32') }, cardinality: 'repeated' })
+        ])]);
+        // One entry with only a value, one with only a key, then a duplicate key that wins
+        const bytes = concat(
+            lenField(1, varintField(2, 9)),
+            lenField(1, lenField(1, 'k')),
+            lenField(1, concat(lenField(1, 'k'), varintField(2, 3)))
+        );
+        expect(toObject(decode(bytes, { schema: maps, type: 'M' }).message)).to.deep.equal({ m: { '': 9n, k: 3n } });
     });
 
     it('replays oneof members and message merges in wire order', () => {

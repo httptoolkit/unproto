@@ -1,13 +1,13 @@
 import { expect } from 'chai';
 import protobuf from 'protobufjs';
 import {
-    parseProto,
     printProto,
     decode,
     toObject,
     type EnumType,
     type MessageType,
-    type Schema
+    type Schema,
+    parseProto
 } from '../src/index.ts';
 import { hex, concat, lenField, varintField, expectProblem } from './test-util.ts';
 
@@ -231,6 +231,13 @@ describe('parseProto', () => {
         expect(message(schema, 'M').fields.get(1)!.jsonName).to.equal('a\tb');
     });
 
+    it('points at the line and column of a problem', () => {
+        const result = parseProto('syntax = "proto3";\nmessage M {\n  int32 a = ;\n}\n', { name: 'api.proto' });
+        expect(result.problems).to.have.length(1);
+        expect(result.problems[0]!.message).to.match(/^api\.proto:3:13: /);
+        expect(result.problems[0]!.offset).to.equal('syntax = "proto3";\nmessage M {\n  int32 a = '.length);
+    });
+
     it('reports an unterminated string literal', () => {
         expectProblem(parseProto('syntax = "proto3').problems, 'parse-error');
         expectProblem(parseProto('syntax = "proto3"; message M { optional string a = 1 [default = "oops]; }').problems, 'parse-error');
@@ -393,7 +400,7 @@ describe('parseProto', () => {
         const result = decode(bytes, { schema, type: 'agree.M' });
         expect(result.problems).to.deep.equal([]);
         expect(toObject(result.message)).to.deep.equal({
-            a: 5n, b: ['x', 'y'], c: [{ key: 'k', value: 1n }], e: 2.5, f: { g: new Uint8Array([9]) }
+            a: 5n, b: ['x', 'y'], c: { k: 1n }, e: 2.5, f: { g: new Uint8Array([9]) }
         });
     });
 });

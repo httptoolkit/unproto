@@ -139,6 +139,38 @@ export interface Schema {
     readonly options?: readonly OptionDecl[];
 }
 
+/**
+ * Resolves a written type reference the way protoc does. A leading dot means
+ * the name is already fully qualified. Otherwise the first component is looked
+ * up in the innermost scope and then in each enclosing one, and the rest of the
+ * name must exist under whichever scope matched. Returns undefined if nothing does.
+ */
+export function resolveTypeName(name: string, scope: string, declared: ReadonlySet<string>): string | undefined {
+    if (name.startsWith('.')) {
+        const full = name.slice(1);
+        return declared.has(full) ? full : undefined;
+    }
+    const first = name.slice(0, name.includes('.') ? name.indexOf('.') : name.length);
+    let current = scope;
+    for (;;) {
+        const prefix = current === '' ? '' : `${current}.`;
+        if (declared.has(prefix + first) || hasNamePrefix(declared, prefix + first)) {
+            const full = prefix + name;
+            return declared.has(full) ? full : undefined;
+        }
+        if (current === '') return undefined;
+        current = current.slice(0, Math.max(0, current.lastIndexOf('.')));
+    }
+}
+
+/** Whether any declared name is nested inside this one, which makes it a usable scope */
+function hasNamePrefix(declared: ReadonlySet<string>, prefix: string): boolean {
+    for (const name of declared) {
+        if (name.startsWith(`${prefix}.`)) return true;
+    }
+    return false;
+}
+
 export const VARINT_SCALARS: ReadonlySet<ScalarType> = new Set<ScalarType>([
     'int32', 'int64', 'uint32', 'uint64', 'sint32', 'sint64', 'bool'
 ]);

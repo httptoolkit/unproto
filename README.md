@@ -140,7 +140,7 @@ isValidProtobuf(bytes); // true if every byte is a well-formed field and there i
 ## API
 
 - `decode(bytes, options?)`: decodes a message, inferring a schema if none is given. Options: `schema`, `type` (full name of the message type), `rootName` (for the inferred root type), `recursionLimit`.
-- `toObject(message, options?)`: flattens a decoded message to a plain object. Options: `keys` (`'auto'`, `'name'` or `'number'`), `prefix`.
+- `toObject(message)`: flattens a decoded message to a plain object.
 - `SchemaInferrer`: accumulates messages of one type with `add(bytes)`; `schema()` infers from everything added so far, `problems()` lists issues. Options: `rootName`, `recursionLimit`, `base` (a schema to extend) and `type`.
 - `inferSchema(samples, options?)`: the same in one call.
 - `printProto(schema, options?)`: renders a schema as `.proto` text (proto3, or edition 2023 when group encoding was seen). Options: `header` comment lines, `indent`.

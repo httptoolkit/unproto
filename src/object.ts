@@ -1,38 +1,29 @@
 import type { Field, Message, Value } from './values.ts';
+import type { FieldType, ScalarType } from './schema.ts';
 
 export type PlainValue = bigint | number | boolean | string | Uint8Array | PlainObject | PlainValue[];
 export interface PlainObject { [key: string]: PlainValue }
 
-export interface ToObjectOptions {
-    /**
-     * How to key the object: by field name, by field number, or (the
-     * default) by name for fields from a real schema and number for inferred ones.
-     */
-    readonly keys?: 'auto' | 'name' | 'number';
-    /** Prepended to every key; useful with numeric keys, e.g. 'f' for f1, f2. */
-    readonly prefix?: string;
-}
-
 /**
  * Flattens a decoded message into a plain object, applying the merge rules a
  * generated parser follows: repeated fields accumulate, singular scalars take
- * the last value, singular messages merge, and setting a oneof member clears
- * the others, all in wire order.
+ * the last value, singular messages merge, maps collapse to an object keyed
+ * by the map key, and setting a oneof member clears the others, all in wire
+ * order. Fields are keyed by name where the schema gives one, and by number
+ * where the definition was inferred.
  */
-export function toObject(message: Message, options: ToObjectOptions = {}): PlainObject {
-    const keys = options.keys ?? 'auto';
-    const prefix = options.prefix ?? '';
+export function toObject(message: Message): PlainObject {
     const object: PlainObject = {};
     const resolved = resolveFields(message);
 
     for (const field of message.fields.values()) {
         const values = resolved.get(field.number);
         if (values === undefined) continue;
-        const useName = keys === 'name' || (keys === 'auto' && field.def !== undefined && field.def.inferred === undefined);
-        const key = prefix + (useName && field.name !== undefined ? field.name : String(field.number));
-        object[key] = isRepeated(field)
-            ? values.map(v => valueToPlain(v, options))
-            : valueToPlain(values[0]!, options);
+        const named = field.name !== undefined && field.def !== undefined && field.def.inferred === undefined;
+        const type = field.def?.type;
+        object[named ? field.name! : String(field.number)] = type?.kind === 'map'
+            ? mapToPlain(values, type)
+            : isRepeated(field) ? values.map(valueToPlain) : valueToPlain(values[0]!);
     }
     return object;
 }
@@ -96,9 +87,47 @@ function mergeMessages(base: Message, next: Message): Message {
     return { type: base.type, fields };
 }
 
-function valueToPlain(value: Value, options: ToObjectOptions): PlainValue {
+/**
+ * Collapses a map field's entry messages into an object. A repeated key takes
+ * its last value, and a missing key or value is its type default, both as a
+ * generated parser would have it. Anything else an entry carries is dropped
+ * here, and remains on the message itself.
+ */
+function mapToPlain(values: readonly Value[], type: FieldType & { kind: 'map' }): PlainObject {
+    const object: PlainObject = {};
+    for (const value of values) {
+        if (value.kind !== 'message') continue;
+        const key = entryPart(value.value, 1) ?? defaultFor({ kind: 'scalar', scalar: type.key });
+        object[String(key)] = entryPart(value.value, 2) ?? defaultFor(type.value);
+    }
+    return object;
+}
+
+/** The last value of a map entry's key or value field, if it has one */
+function entryPart(entry: Message, number: number): PlainValue | undefined {
+    const value = entry.fields.get(number)?.values.at(-1);
+    return value === undefined ? undefined : valueToPlain(value);
+}
+
+function defaultFor(type: FieldType): PlainValue {
+    switch (type.kind) {
+        case 'message':
+        case 'map': return {};
+        case 'enum': return 0n;
+        case 'scalar': return SCALAR_DEFAULTS[type.scalar];
+    }
+}
+
+const SCALAR_DEFAULTS: Record<ScalarType, PlainValue> = {
+    double: 0, float: 0,
+    int32: 0n, int64: 0n, uint32: 0n, uint64: 0n, sint32: 0n, sint64: 0n,
+    fixed32: 0n, fixed64: 0n, sfixed32: 0n, sfixed64: 0n,
+    bool: false, string: '', bytes: new Uint8Array(0)
+};
+
+function valueToPlain(value: Value): PlainValue {
     switch (value.kind) {
-        case 'message': return toObject(value.value, options);
+        case 'message': return toObject(value.value);
         case 'enum': return value.name ?? value.value;
         case 'raw': {
             const wire = value.wire;

@@ -10,9 +10,10 @@ import {
     fieldDef,
     scalar,
     type Message,
-    type PlainObject
+    type PlainObject,
+    encodeMessage,
+    encodeObject
 } from '../src/index.ts';
-import { encodeMessage, encodeObject } from '../src/encode.ts';
 import { hex, concat, varint, tag, utf8, lenField, varintField, expectProblem, expectNoProblems } from './test-util.ts';
 
 function toHex(bytes: Uint8Array): string {
