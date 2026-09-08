@@ -49,12 +49,13 @@ export function decode(input: Uint8Array, options: DecodeOptions = {}): DecodeRe
     }
 
     const types = new Map<string, NamedType>(schema.types);
-    const ctx: InterpretContext = { types, problems, recursionLimit };
+    const inferred = new Set<string>(options.schema ? [] : types.keys());
+    const ctx: InterpretContext = { types, inferred, problems, recursionLimit };
     const message = interpretMessage(wire.fields, type, ctx, [], 0);
 
     return {
         message,
-        schema: types.size === schema.types.size ? schema : { ...schema, types },
+        schema: options.schema && inferred.size > 0 ? { ...schema, types } : schema,
         wire,
         problems
     };

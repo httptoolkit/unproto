@@ -176,7 +176,7 @@ function readFields(state: State, start: number, end: number, depth: number, gro
         const tag = readVarint(input, pos, end);
         if (tag === 'truncated') return stop('truncated', 'Input ended in the middle of a tag', tagStart);
         if (tag === 'too-long') return stop('invalid-tag', 'Tag varint is longer than 10 bytes', tagStart);
-        if (tag.value > 0xFFFFFFFFn) return stop('invalid-tag', `Tag value ${tag.value} does not fit in 32 bits`, tagStart);
+        if (tag.overflow || tag.value > 0xFFFFFFFFn) return stop('invalid-tag', 'Tag value does not fit in 32 bits', tagStart);
         pos += tag.length;
 
         const tagNumber = Number(tag.value);
@@ -226,7 +226,7 @@ function readFields(state: State, start: number, end: number, depth: number, gro
                 const length = readVarint(input, pos, end);
                 if (length === 'truncated') return stop('truncated', `Input ended inside the length of field ${number}`, tagStart);
                 if (length === 'too-long') return stop('length-too-large', `Length of field ${number} is not a valid varint`, tagStart);
-                if (length.value > BigInt(MAX_LENGTH)) return stop('length-too-large', `Length ${length.value} of field ${number} exceeds 2^31 - 1`, tagStart);
+                if (length.overflow || length.value > BigInt(MAX_LENGTH)) return stop('length-too-large', `Length of field ${number} exceeds 2^31 - 1`, tagStart);
                 const valueStart = pos + length.length;
                 const valueEnd = valueStart + Number(length.value);
                 if (valueEnd > end) {

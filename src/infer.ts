@@ -1,4 +1,4 @@
-import { decodeWire, type WireField, type WireMessage, type WireType } from './wire.ts';
+import { decodeWire, type WireField, type WireI32, type WireI64, type WireMessage, type WireType } from './wire.ts';
 import {
     scalar,
     type AlternativeType,
@@ -9,7 +9,7 @@ import {
     type Presence,
     type Schema
 } from './schema.ts';
-import { analyzeLen, isReasonableFloat, BYTES_SCORE, type LenAnalysis } from './heuristics.ts';
+import { analyzeLen, isReasonableFloat, BYTES_SCORE, NEUTRAL_SCORE, type Candidate as LenCandidate, type LenAnalysis } from './heuristics.ts';
 
 export interface InferOptions {
     /** Name given to the root message type. Defaults to 'Message'. */
@@ -30,8 +30,8 @@ export function inferSchema(samples: readonly Uint8Array[], options: InferOption
 export function inferSchemaFromWire(samples: readonly WireMessage[], options: InferOptions = {}): Schema {
     const rootName = options.rootName ?? 'Message';
     const types = new Map<string, NamedType>();
-    const inferrer = new Inferrer(types, options.recursionLimit ?? 100);
-    inferrer.inferMessageType(rootName, samples.map(w => w.fields), 0);
+    const inferrer = new Inferrer(types, options.recursionLimit ?? 100, new Set());
+    inferrer.inferMessageType(inferrer.allocateName(rootName), samples.map(w => w.fields), 0);
     return inferrer.needsEditions
         ? { syntax: 'editions', edition: '2023', types }
         : { syntax: 'proto3', types };
@@ -44,13 +44,24 @@ export class Inferrer {
     /** Set when the data uses group encoding, which proto3 cannot express */
     needsEditions = false;
 
-    /** All types inferred so far, keyed by full name */
+    /** All known types, keyed by full name; inferred types are added here */
     readonly types: Map<string, NamedType>;
+    /** The names in `types` that inference owns and may replace; anything else is left alone */
+    readonly owned: Set<string>;
     readonly recursionLimit: number;
 
-    constructor(types: Map<string, NamedType>, recursionLimit: number) {
+    constructor(types: Map<string, NamedType>, recursionLimit: number, owned: Set<string>) {
         this.types = types;
         this.recursionLimit = recursionLimit;
+        this.owned = owned;
+    }
+
+    /** Returns the name itself, or a numbered variant if a supplied type already uses it */
+    allocateName(base: string): string {
+        let name = base;
+        for (let i = 2; this.types.has(name) && !this.owned.has(name); i++) name = `${base}_${i}`;
+        this.owned.add(name);
+        return name;
     }
 
     /**
@@ -97,7 +108,7 @@ export class Inferrer {
             (counts.get(wt) ?? 0) > (counts.get(best) ?? 0) ? wt : best);
 
         const repeated = perSample.some(s => s.length > 1);
-        const nestedName = `${parentFullName}.Field${number}`;
+        let nestedName = `${parentFullName}.Field${number}`;
 
         let type: FieldType;
         let alternatives: AlternativeType[] = [];
@@ -117,7 +128,9 @@ export class Inferrer {
             case 1:
             case 5: {
                 const size = dominant === 1 ? 8 : 4;
-                const chunks = all.filter(f => f.kind === 'i64' || f.kind === 'i32').map(f => f.bytes);
+                const chunks = all
+                    .filter((f): f is WireI64 | WireI32 => f.wireType === dominant)
+                    .map(f => f.bytes);
                 ({ type, alternatives } = fixedTypes(chunks, size));
                 if (chunks.some(c => c.every(b => b === 0))) presence = 'explicit';
                 break;
@@ -134,6 +147,7 @@ export class Inferrer {
                 const chosen = ranked[0]!;
 
                 if (analyses.some(a => a.message)) {
+                    nestedName = this.allocateName(nestedName);
                     const nestedSamples = analyses.map(a => a.message?.wire.fields ?? []);
                     this.inferMessageType(nestedName, nestedSamples, depth + 1);
                 }
@@ -157,6 +171,7 @@ export class Inferrer {
             }
             case 3: {
                 const groups = all.filter(f => f.kind === 'group');
+                nestedName = this.allocateName(nestedName);
                 this.inferMessageType(nestedName, groups.map(g => g.fields), depth + 1);
                 type = { kind: 'message', name: nestedName };
                 delimited = true;
@@ -231,8 +246,10 @@ interface PackedEvidence {
 /**
  * Combines per-occurrence analyses into an ordered list of candidate
  * readings for the field as a whole. A reading must be possible for every
- * non-empty occurrence, and its score is its worst score among them, so
- * one convincing occurrence cannot carry an unconvincing one.
+ * non-empty occurrence, and its score is its worst score among the
+ * occurrences that carry evidence, so one convincing occurrence cannot
+ * carry an unconvincing one, while neutral ones (such as single-element
+ * packed chunks) neither help nor hurt.
  */
 function rankCandidates(analyses: readonly LenAnalysis[], evidence: PackedEvidence): Candidate[] {
     const nonEmpty = analyses.filter(a => a.length > 0);
@@ -241,21 +258,24 @@ function rankCandidates(analyses: readonly LenAnalysis[], evidence: PackedEviden
     const scores = new Map<Candidate, number>();
     scores.set('bytes', BYTES_SCORE);
 
-    const consider = (candidate: Candidate, score: (a: LenAnalysis) => number | undefined, boost: number) => {
+    const consider = (candidate: Candidate, get: (a: LenAnalysis) => LenCandidate | undefined, boost: number) => {
         let worst = 1;
+        let anyEvidence = false;
         for (const analysis of nonEmpty) {
-            const value = score(analysis);
-            if (value === undefined) return;
-            worst = Math.min(worst, value);
+            const entry = get(analysis);
+            if (entry === undefined) return;
+            if (entry.neutral) continue;
+            worst = Math.min(worst, entry.score);
+            anyEvidence = true;
         }
-        scores.set(candidate, worst + boost);
+        scores.set(candidate, (anyEvidence ? worst : NEUTRAL_SCORE) + boost);
     };
 
-    consider('message', a => a.message?.score, 0);
-    consider('string', a => a.string?.score, 0);
-    consider('packedVarint', a => a.packedVarint?.score, evidence.varint ? 0.5 : 0);
-    consider('packedI32', a => a.packedI32?.score, evidence.i32 ? 0.5 : 0);
-    consider('packedI64', a => a.packedI64?.score, evidence.i64 ? 0.5 : 0);
+    consider('message', a => a.message, 0);
+    consider('string', a => a.string, 0);
+    consider('packedVarint', a => a.packedVarint, evidence.varint ? 0.5 : 0);
+    consider('packedI32', a => a.packedI32, evidence.i32 ? 0.5 : 0);
+    consider('packedI64', a => a.packedI64, evidence.i64 ? 0.5 : 0);
 
     return CANDIDATE_ORDER
         .filter(c => scores.has(c))

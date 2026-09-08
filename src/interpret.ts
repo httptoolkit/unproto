@@ -20,6 +20,8 @@ import { Inferrer } from './infer.ts';
 export interface InterpretContext {
     /** All known types. Types inferred for unknown fields are added here. */
     readonly types: Map<string, NamedType>;
+    /** Names in `types` that were inferred rather than supplied, so inference may replace them */
+    readonly inferred: Set<string>;
     readonly problems: Problem[];
     readonly recursionLimit: number;
 }
@@ -52,7 +54,7 @@ export function interpretMessage(
                     path: fieldPath
                 });
             }
-            const inferrer = new Inferrer(ctx.types, ctx.recursionLimit);
+            const inferrer = new Inferrer(ctx.types, ctx.recursionLimit, ctx.inferred);
             def = inferrer.inferField(number, [occurrences], type?.fullName ?? 'Unknown', depth);
         }
         out.set(number, interpretField(occurrences, def, ctx, fieldPath, depth));
@@ -71,7 +73,13 @@ function interpretField(
     const values = occurrences.flatMap(occ => interpretOccurrence(occ, def, ctx, path, depth));
 
     const alternatives: Alternative[] = (def.inferred?.alternatives ?? []).map(alt => {
-        const altDef = fieldDef({ ...def, type: alt.type, packed: alt.packed, inferred: undefined });
+        const altDef = fieldDef({
+            ...def,
+            type: alt.type,
+            packed: alt.packed,
+            cardinality: alt.packed ? 'repeated' : def.cardinality,
+            inferred: undefined
+        });
         const scratch: InterpretContext = { ...ctx, problems: [] };
         return {
             type: alt.type,
@@ -127,7 +135,7 @@ function interpretOccurrence(
     return [{ kind: 'raw', wire: occ }];
 }
 
-const utf8 = new TextDecoder('utf-8', { fatal: true });
+const utf8 = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
 
 function fromString(occ: WireLen, def: FieldDef, ctx: InterpretContext, path: readonly number[]): Value {
     try {
@@ -233,6 +241,14 @@ function fromPacked(occ: WireLen, def: FieldDef, ctx: InterpretContext, path: re
             if (varint === 'truncated' || varint === 'too-long') {
                 fail('ends with an incomplete varint', pos);
                 break;
+            }
+            if (varint.overflow) {
+                ctx.problems.push({
+                    code: 'varint-overflow',
+                    message: `Packed field ${def.number} (${def.name}) has a value with bits beyond 64 (ignored)`,
+                    offset: occ.valueRange.start + pos,
+                    path
+                });
             }
             values.push(type.kind === 'enum' ? enumValue(type.name, varint.value, ctx) : fromVarint(type.scalar, varint.value));
             pos += varint.length;

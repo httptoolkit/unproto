@@ -8,16 +8,28 @@ import { decodeWire, readVarint, type WireMessage } from './wire.ts';
  */
 export interface LenAnalysis {
     readonly length: number;
-    readonly message?: { readonly wire: WireMessage; readonly score: number };
-    readonly string?: { readonly value: string; readonly score: number };
-    readonly packedVarint?: { readonly count: number; readonly score: number };
-    readonly packedI32?: { readonly count: number; readonly score: number };
-    readonly packedI64?: { readonly count: number; readonly score: number };
+    readonly message?: Candidate & { readonly wire: WireMessage };
+    readonly string?: Candidate & { readonly value: string };
+    readonly packedVarint?: PackedCandidate;
+    readonly packedI32?: PackedCandidate;
+    readonly packedI64?: PackedCandidate;
+}
+
+export interface Candidate {
+    readonly score: number;
+    /** A valid but uninformative reading, e.g. a single-element packed chunk */
+    readonly neutral?: boolean;
+}
+
+export interface PackedCandidate extends Candidate {
+    readonly count: number;
 }
 
 export const BYTES_SCORE = 0.3;
+/** The score of a reading that is possible but has no evidence for it */
+export const NEUTRAL_SCORE = 0.2;
 
-const utf8 = new TextDecoder('utf-8', { fatal: true });
+const utf8 = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
 
 /** How many nested length-delimited fields we look inside when scoring a candidate message */
 const MAX_NESTED_CHECKS = 8;
@@ -29,14 +41,14 @@ export function analyzeLen(bytes: Uint8Array, depth: number, recursionLimit: num
     if (depth < recursionLimit) {
         const wire = decodeWire(bytes);
         if (wire.problems.length === 0 && wire.trailing === undefined && wire.fields.length > 0) {
-            message = { wire, score: scoreMessage(wire, depth, recursionLimit) };
+            message = { wire, score: scoreMessage(wire, bytes.length, depth, recursionLimit) };
         }
     }
 
     let string: LenAnalysis['string'];
     try {
         const value = utf8.decode(bytes);
-        string = { value, score: scoreString(value) };
+        string = { value, score: scoreString(value, bytes, message !== undefined) };
     } catch {
         // Not UTF-8
     }
@@ -62,31 +74,48 @@ export function bestNonBytesScore(analysis: LenAnalysis): number {
     );
 }
 
-function scoreString(value: string): number {
+function scoreString(value: string, bytes: Uint8Array, couldBeMessage: boolean): number {
     if (value.includes('\0')) return 0.05;
     let total = 0;
     let printable = 0;
+    let hardControls = 0;
+    let leadingWhitespaceControls = 0;
     for (const char of value) {
         total++;
         const code = char.codePointAt(0)!;
-        const control = (code < 0x20 && code !== 0x09 && code !== 0x0a && code !== 0x0d)
+        const whitespaceControl = code === 0x09 || code === 0x0a || code === 0x0d;
+        const control = (code < 0x20 && !whitespaceControl)
             || (code >= 0x7f && code <= 0x9f)
             || code === 0xfffd;
-        if (!control) printable++;
+        if (control) hardControls++;
+        else printable++;
+        if (whitespaceControl && total <= 2) leadingWhitespaceControls++;
     }
     const ratio = printable / total;
-    return ratio * ratio;
+    let score = ratio * ratio;
+    // Control characters other than tab/newline hardly ever appear in real text, but
+    // are exactly what small tags and lengths look like
+    score -= 0.25 * hardControls;
+    // Text rarely starts with a tab or newline; message fields 1 and 2 encode as those
+    score -= 0.15 * leadingWhitespaceControls;
+    // A printable first byte that is also a length-delimited tag, when the rest lines up
+    // as a message, is a suspicious coincidence
+    if (couldBeMessage && (bytes[0]! & 0x7) === 2) score -= 0.1;
+    return Math.max(0, score);
 }
 
-function scoreMessage(wire: WireMessage, depth: number, recursionLimit: number): number {
+function scoreMessage(wire: WireMessage, payloadLength: number, depth: number, recursionLimit: number): number {
     let score = 0.6;
 
     const wireTypesByNumber = new Map<number, Set<number>>();
     let hasGroups = false;
     let hasNonCanonical = false;
     let smallNumberBonus = 0;
-    let largeNumberPenalty = 0;
-    let nestedBonus = 0;
+    let hasLargeNumber = false;
+    let hasReservedNumber = false;
+    let ascending = true;
+    let previousNumber = 0;
+    let coveredBytes = 0;
     let nestedPenalty = 0;
     let nestedChecked = 0;
 
@@ -96,18 +125,20 @@ function scoreMessage(wire: WireMessage, depth: number, recursionLimit: number):
             types = new Set();
             wireTypesByNumber.set(field.number, types);
             if (field.number <= 15) smallNumberBonus = Math.min(0.15, smallNumberBonus + 0.05);
-            if (field.number >= 19000 && field.number <= 19999) largeNumberPenalty += 0.3;
-            else if (field.number > 1000) largeNumberPenalty = Math.min(0.3, largeNumberPenalty + 0.15);
+            if (field.number >= 19000 && field.number <= 19999) hasReservedNumber = true;
+            else if (field.number > 1000) hasLargeNumber = true;
         }
         types.add(field.wireType);
+        if (field.number < previousNumber) ascending = false;
+        previousNumber = field.number;
 
         if (field.kind === 'group') hasGroups = true;
         if (field.kind === 'varint' && field.nonCanonical) hasNonCanonical = true;
         if (field.kind === 'len' && field.bytes.length > 0 && nestedChecked < MAX_NESTED_CHECKS) {
             nestedChecked++;
             const best = bestNonBytesScore(analyzeLen(field.bytes, depth + 1, recursionLimit));
-            if (best >= 0.7) nestedBonus = Math.min(0.2, nestedBonus + 0.1);
-            else if (best > BYTES_SCORE) nestedBonus = Math.min(0.2, nestedBonus + 0.05);
+            if (best >= 0.7) coveredBytes += field.bytes.length;
+            else if (best > BYTES_SCORE) coveredBytes += field.bytes.length / 2;
             else nestedPenalty = Math.min(0.2, nestedPenalty + 0.1);
         }
     }
@@ -115,13 +146,20 @@ function scoreMessage(wire: WireMessage, depth: number, recursionLimit: number):
     const distinct = wireTypesByNumber.size;
     score += (Math.min(distinct, 3) - 1) * 0.075;
     score += smallNumberBonus;
-    score -= largeNumberPenalty;
+    // Large field numbers are unusual but legal, so they count once and lightly;
+    // the reserved range should never appear on the wire
+    if (hasReservedNumber) score -= 0.3;
+    else if (hasLargeNumber) score -= 0.1;
+    // Serializers write fields in number order, so a coherent message usually is
+    if (distinct >= 2) score += ascending ? 0.05 : -0.05;
     for (const types of wireTypesByNumber.values()) {
         if (types.size > 1) { score -= 0.4; break; }
     }
     if (hasGroups) score -= 0.1;
     if (hasNonCanonical) score -= 0.2;
-    score += nestedBonus - nestedPenalty;
+    // Nested values that read well themselves explain the payload: the more of it they
+    // cover, the less likely the tag and length bytes around them are a coincidence
+    score += 0.3 * (coveredBytes / payloadLength) - nestedPenalty;
 
     return Math.max(0, Math.min(1, score));
 }
@@ -141,7 +179,8 @@ function analyzePackedVarints(bytes: Uint8Array): LenAnalysis['packedVarint'] {
         pos += varint.length;
         count++;
     }
-    if (count < 2) return undefined;
+    if (count === 0) return undefined;
+    if (count === 1) return { count, score: NEUTRAL_SCORE, neutral: true };
     let score = 0.4;
     if (count >= 3) score += 0.1;
     // Little-endian fixed-width integers read as varints produce runs of zeros
@@ -156,8 +195,9 @@ function analyzePackedVarints(bytes: Uint8Array): LenAnalysis['packedVarint'] {
 const SMALL_INT_LIMIT = { 4: 2n ** 23n, 8: 2n ** 31n } as const;
 
 function analyzePackedFixed(bytes: Uint8Array, size: 4 | 8): LenAnalysis['packedI32'] {
-    if (bytes.length % size !== 0 || bytes.length < size * 2) return undefined;
+    if (bytes.length % size !== 0 || bytes.length === 0) return undefined;
     const count = bytes.length / size;
+    if (count === 1) return { count, score: NEUTRAL_SCORE, neutral: true };
     const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
     let allReasonableFloats = true;
     let anyZero = false;

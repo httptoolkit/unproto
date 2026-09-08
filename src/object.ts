@@ -22,13 +22,32 @@ export function toObject(message: Message, options: ToObjectOptions = {}): Plain
     const keys = options.keys ?? 'auto';
     const prefix = options.prefix ?? '';
     const object: PlainObject = {};
+    const oneofWinners = selectOneofMembers(message);
 
     for (const field of message.fields.values()) {
+        if (field.def?.oneof !== undefined && oneofWinners.get(field.def.oneof) !== field) continue;
         const useName = keys === 'name' || (keys === 'auto' && field.def !== undefined && field.def.inferred === undefined);
         const key = prefix + (useName && field.name !== undefined ? field.name : String(field.number));
         object[key] = fieldToPlain(field, options);
     }
     return object;
+}
+
+/** Only the last-written member of each oneof is set, as a generated parser would see it */
+function selectOneofMembers(message: Message): Map<string, Field> {
+    const winners = new Map<string, Field>();
+    for (const field of message.fields.values()) {
+        const oneof = field.def?.oneof;
+        if (oneof === undefined) continue;
+        const current = winners.get(oneof);
+        if (!current || lastOffset(field) > lastOffset(current)) winners.set(oneof, field);
+    }
+    return winners;
+}
+
+function lastOffset(field: Field): number {
+    const last = field.raw[field.raw.length - 1];
+    return last ? last.range.start : -1;
 }
 
 function fieldToPlain(field: Field, options: ToObjectOptions): PlainValue {

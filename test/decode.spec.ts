@@ -165,9 +165,9 @@ describe('decode without a schema', () => {
     });
 
     it('judges a repeated field by its least convincing occurrence', () => {
-        // "'P" alone would be a fine string, but "\x13" is not, so both are bytes
-        const input = concat(lenField(20, hex('27 50')), lenField(20, hex('13')));
-        expect(toObject(decode(input).message)).to.deep.equal({ '20': [hex('27 50'), hex('13')] });
+        // "'P" alone would be a fine string, but U+0080 (a control character) is not, so both are bytes
+        const input = concat(lenField(20, hex('27 50')), lenField(20, hex('c2 80')));
+        expect(toObject(decode(input).message)).to.deep.equal({ '20': [hex('27 50'), hex('c2 80')] });
     });
 
     it('keeps every value of a repeated field, including a falsy first one', () => {
