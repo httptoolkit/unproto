@@ -1,4 +1,4 @@
-import { decodeWire, type WireField, type WireI32, type WireI64, type WireMessage, type WireType } from './wire.ts';
+import { decodeWire, type WireField, type WireI32, type WireI64, type WireLen, type WireMessage, type WireType } from './wire.ts';
 import {
     scalar,
     type AlternativeType,
@@ -11,12 +11,16 @@ import {
 } from './schema.ts';
 import {
     analyzeLen,
+    analyzePackedFixed,
+    analyzePackedVarints,
     isReasonableFloat,
+    isWellFormed,
     BYTES_SCORE,
     NEUTRAL_SCORE,
     type AnalysisCache,
     type Candidate as LenCandidate,
-    type LenAnalysis
+    type LenAnalysis,
+    type PackedCandidate
 } from './heuristics.ts';
 import type { Problem } from './problem.ts';
 
@@ -40,7 +44,7 @@ export function inferSchemaFromWire(samples: readonly WireMessage[], options: In
     const rootName = options.rootName ?? 'Message';
     const types = new Map<string, NamedType>();
     const inferrer = new Inferrer(types, options.recursionLimit ?? 100, new Set(), problems);
-    inferrer.inferMessageType(inferrer.allocateName(rootName), samples.map(w => w.fields), 0);
+    inferrer.inferMessageType(inferrer.allocateName(rootName), samples.map(w => w.fields), 0, []);
     return inferrer.needsEditions
         ? { syntax: 'editions', edition: '2023', types }
         : { syntax: 'proto3', types };
@@ -55,7 +59,7 @@ export class Inferrer {
 
     /** All known types, keyed by full name; inferred types are added here */
     readonly types: Map<string, NamedType>;
-    /** The names in `types` that inference owns and may replace; anything else is left alone */
+    /** The names inference has added to `types` */
     readonly owned: Set<string>;
     readonly recursionLimit: number;
     readonly problems: Problem[];
@@ -68,10 +72,14 @@ export class Inferrer {
         this.problems = problems;
     }
 
-    /** Returns the name itself, or a numbered variant if a supplied type already uses it */
+    /**
+     * Returns the name itself, or a numbered variant if it is taken. Existing
+     * types are never replaced, even inferred ones: decoded values may still
+     * refer to them, and alternatives are interpreted on demand.
+     */
     allocateName(base: string): string {
         let name = base;
-        for (let i = 2; this.types.has(name) && !this.owned.has(name); i++) name = `${base}_${i}`;
+        for (let i = 2; this.types.has(name); i++) name = `${base}_${i}`;
         this.owned.add(name);
         return name;
     }
@@ -80,7 +88,7 @@ export class Inferrer {
      * Infers (and registers) a message type from samples, each being the
      * field list of one message of that type.
      */
-    inferMessageType(fullName: string, samples: readonly (readonly WireField[])[], depth: number): MessageType {
+    inferMessageType(fullName: string, samples: readonly (readonly WireField[])[], depth: number, path: readonly number[]): MessageType {
         const perNumber = new Map<number, WireField[][]>();
         samples.forEach((fields, sampleIndex) => {
             for (const field of fields) {
@@ -95,7 +103,7 @@ export class Inferrer {
 
         const fields = new Map<number, FieldDef>();
         for (const [number, perSample] of perNumber) {
-            fields.set(number, this.inferField(number, perSample, fullName, depth));
+            fields.set(number, this.inferField(number, perSample, fullName, depth, path));
         }
 
         const type: MessageType = {
@@ -111,8 +119,11 @@ export class Inferrer {
         return type;
     }
 
-    /** Infers a field from its occurrences, grouped per sample message */
-    inferField(number: number, perSample: readonly (readonly WireField[])[], parentFullName: string, depth: number): FieldDef {
+    /**
+     * Infers a field from its occurrences, grouped per sample message. `depth`
+     * and `path` locate the containing message, for limits and diagnostics.
+     */
+    inferField(number: number, perSample: readonly (readonly WireField[])[], parentFullName: string, depth: number, path: readonly number[]): FieldDef {
         const all = perSample.flat();
         const counts = new Map<WireType, number>();
         for (const field of all) counts.set(field.wireType, (counts.get(field.wireType) ?? 0) + 1);
@@ -120,6 +131,7 @@ export class Inferrer {
             (counts.get(wt) ?? 0) > (counts.get(best) ?? 0) ? wt : best);
 
         const repeated = perSample.some(s => s.length > 1);
+        const fieldPath = [...path, number];
         let nestedName = `${parentFullName}.Field${number}`;
 
         let type: FieldType;
@@ -149,27 +161,20 @@ export class Inferrer {
             }
             case 2: {
                 const occurrences = all.filter(f => f.kind === 'len');
-                const analyses = occurrences.map(o => analyzeLen(o.bytes, depth, this.recursionLimit, this.cache));
-                const tooDeep = depth >= this.recursionLimit && occurrences.find(o => o.bytes.length > 0);
-                if (tooDeep) {
-                    this.problems.push({
-                        code: 'recursion-limit',
-                        message: `Field ${number} is nested deeper than the limit of ${this.recursionLimit}; its content was not analysed`,
-                        offset: tooDeep.range.start
-                    });
-                }
+                const analyses = occurrences.map(o => analyzeLen(o.bytes, o.valueRange.start, depth, this.recursionLimit, this.cache));
+                if (depth >= this.recursionLimit) this.reportUnanalysed(occurrences, fieldPath);
                 const evidence = {
                     varint: (counts.get(0) ?? 0) > 0,
                     i32: (counts.get(5) ?? 0) > 0,
                     i64: (counts.get(1) ?? 0) > 0
                 };
-                const ranked = rankCandidates(analyses, evidence);
+                const ranked = rankCandidates(analyses, occurrences.map(o => o.bytes), evidence);
                 const chosen = ranked[0]!;
 
                 if (analyses.some(a => a.message)) {
                     nestedName = this.allocateName(nestedName);
                     const nestedSamples = analyses.map(a => a.message?.wire.fields ?? []);
-                    this.inferMessageType(nestedName, nestedSamples, depth + 1);
+                    this.inferMessageType(nestedName, nestedSamples, depth + 1, fieldPath);
                 }
 
                 const toType = (candidate: Candidate): AlternativeType => {
@@ -192,7 +197,7 @@ export class Inferrer {
             case 3: {
                 const groups = all.filter(f => f.kind === 'group');
                 nestedName = this.allocateName(nestedName);
-                this.inferMessageType(nestedName, groups.map(g => g.fields), depth + 1);
+                this.inferMessageType(nestedName, groups.map(g => g.fields), depth + 1, fieldPath);
                 type = { kind: 'message', name: nestedName };
                 delimited = true;
                 this.needsEditions = true;
@@ -216,6 +221,22 @@ export class Inferrer {
             delimited,
             inferred: { alternatives }
         };
+    }
+
+    /**
+     * At the recursion limit payloads are not analysed as messages. That only
+     * loses information if one actually is well-formed protobuf, so only then
+     * is it reported, with the position of the record concerned.
+     */
+    private reportUnanalysed(occurrences: readonly WireLen[], fieldPath: readonly number[]): void {
+        const skipped = occurrences.find(o => o.bytes.length > 0 && isWellFormed(decodeWire(o.bytes, { offset: o.valueRange.start })));
+        if (!skipped) return;
+        this.problems.push({
+            code: 'recursion-limit',
+            message: `Field ${fieldPath[fieldPath.length - 1]} is nested deeper than the limit of ${this.recursionLimit}; its content was not analysed as a message`,
+            offset: skipped.range.start,
+            path: fieldPath
+        });
     }
 }
 
@@ -263,39 +284,71 @@ interface PackedEvidence {
     readonly i64: boolean;
 }
 
+/** Enough to outrank any score a message or string can reach */
+const DECISIVE_BOOST = 1;
+
+function concat(parts: readonly Uint8Array[]): Uint8Array {
+    const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+    let offset = 0;
+    for (const part of parts) {
+        out.set(part, offset);
+        offset += part.length;
+    }
+    return out;
+}
+
 /**
  * Combines per-occurrence analyses into an ordered list of candidate
  * readings for the field as a whole. A reading must be possible for every
- * non-empty occurrence, and its score is its worst score among the
- * occurrences that carry evidence, so one convincing occurrence cannot
- * carry an unconvincing one, while neutral ones (such as single-element
- * packed chunks) neither help nor hurt.
+ * non-empty occurrence. Messages and strings score by their worst
+ * occurrence, so one convincing occurrence cannot carry an unconvincing
+ * one. Packed lists score on the concatenation of all chunks, so evidence
+ * accumulates across chunk boundaries and single-element chunks count.
+ * Unpacked records of the same field settle the matter for their kind: a
+ * field cannot be both a string and an integer.
  */
-function rankCandidates(analyses: readonly LenAnalysis[], evidence: PackedEvidence): Candidate[] {
-    const nonEmpty = analyses.filter(a => a.length > 0);
-    if (nonEmpty.length === 0) return ['string', 'bytes', 'message'];
+function rankCandidates(analyses: readonly LenAnalysis[], chunks: readonly Uint8Array[], evidence: PackedEvidence): Candidate[] {
+    const nonEmpty: number[] = [];
+    analyses.forEach((a, i) => { if (a.length > 0) nonEmpty.push(i); });
+
+    if (nonEmpty.length === 0) {
+        if (evidence.varint) return ['packedVarint', 'string', 'bytes', 'message'];
+        if (evidence.i32) return ['packedI32', 'string', 'bytes', 'message'];
+        if (evidence.i64) return ['packedI64', 'string', 'bytes', 'message'];
+        return ['string', 'bytes', 'message'];
+    }
 
     const scores = new Map<Candidate, number>();
     scores.set('bytes', BYTES_SCORE);
 
-    const consider = (candidate: Candidate, get: (a: LenAnalysis) => LenCandidate | undefined, boost: number) => {
+    const worstOf = (candidate: Candidate, get: (a: LenAnalysis) => LenCandidate | undefined) => {
         let worst = 1;
-        let anyEvidence = false;
-        for (const analysis of nonEmpty) {
-            const entry = get(analysis);
+        for (const i of nonEmpty) {
+            const entry = get(analyses[i]!);
             if (entry === undefined) return;
-            if (entry.neutral) continue;
             worst = Math.min(worst, entry.score);
-            anyEvidence = true;
         }
-        scores.set(candidate, (anyEvidence ? worst : NEUTRAL_SCORE) + boost);
+        scores.set(candidate, worst);
     };
+    worstOf('message', a => a.message);
+    worstOf('string', a => a.string);
 
-    consider('message', a => a.message, 0);
-    consider('string', a => a.string, 0);
-    consider('packedVarint', a => a.packedVarint, evidence.varint ? 0.5 : 0);
-    consider('packedI32', a => a.packedI32, evidence.i32 ? 0.5 : 0);
-    consider('packedI64', a => a.packedI64, evidence.i64 ? 0.5 : 0);
+    const packed = (
+        candidate: Candidate,
+        get: (a: LenAnalysis) => PackedCandidate | undefined,
+        analyzeAll: (bytes: Uint8Array) => PackedCandidate | undefined,
+        decisive: boolean
+    ) => {
+        for (const i of nonEmpty) if (get(analyses[i]!) === undefined) return;
+        const combined = nonEmpty.length === 1
+            ? get(analyses[nonEmpty[0]!]!)
+            : analyzeAll(concat(nonEmpty.map(i => chunks[i]!)));
+        if (combined === undefined) return;
+        scores.set(candidate, (combined.neutral ? NEUTRAL_SCORE : combined.score) + (decisive ? DECISIVE_BOOST : 0));
+    };
+    packed('packedVarint', a => a.packedVarint, b => analyzePackedVarints(b), evidence.varint);
+    packed('packedI32', a => a.packedI32, b => analyzePackedFixed(b, 4), evidence.i32);
+    packed('packedI64', a => a.packedI64, b => analyzePackedFixed(b, 8), evidence.i64);
 
     return CANDIDATE_ORDER
         .filter(c => scores.has(c))

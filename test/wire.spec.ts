@@ -193,6 +193,12 @@ describe('decodeWire', () => {
         expect(field.kind === 'len' && field.bytes.buffer).to.equal(input.buffer);
     });
 
+    it('accepts zero-extended tags and lengths as non-canonical', () => {
+        const wire = decodeWire(hex('8a 80 80 80 80 80 80 80 80 00 81 80 80 80 80 80 80 00 41'));
+        expectNoProblems(wire.problems);
+        expect(wire.fields[0]).to.deep.include({ kind: 'len', number: 1, bytes: hex('41'), nonCanonicalLength: true });
+    });
+
     it('rejects tags and lengths whose varints overflow 64 bits', () => {
         const length = decodeWire(hex('0a 80 80 80 80 80 80 80 80 80 02'));
         expectProblem(length.problems, 'length-too-large', 0);

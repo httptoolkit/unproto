@@ -14,55 +14,86 @@ export interface ToObjectOptions {
 }
 
 /**
- * Flattens a decoded message into a plain object, merging occurrences the
- * way a generated parser would: repeated fields become arrays, singular
- * scalars take the last value, singular messages are merged.
+ * Flattens a decoded message into a plain object, applying the merge rules a
+ * generated parser follows: repeated fields accumulate, singular scalars take
+ * the last value, singular messages merge, and setting a oneof member clears
+ * the others, all in wire order.
  */
 export function toObject(message: Message, options: ToObjectOptions = {}): PlainObject {
     const keys = options.keys ?? 'auto';
     const prefix = options.prefix ?? '';
     const object: PlainObject = {};
-    const oneofWinners = selectOneofMembers(message);
+    const resolved = resolveFields(message);
 
     for (const field of message.fields.values()) {
-        if (field.def?.oneof !== undefined && oneofWinners.get(field.def.oneof) !== field) continue;
+        const values = resolved.get(field.number);
+        if (values === undefined) continue;
         const useName = keys === 'name' || (keys === 'auto' && field.def !== undefined && field.def.inferred === undefined);
         const key = prefix + (useName && field.name !== undefined ? field.name : String(field.number));
-        object[key] = fieldToPlain(field, options);
+        object[key] = isRepeated(field)
+            ? values.map(v => valueToPlain(v, options))
+            : valueToPlain(values[0]!, options);
     }
     return object;
 }
 
-/** Only the last-written member of each oneof is set, as a generated parser would see it */
-function selectOneofMembers(message: Message): Map<string, Field> {
-    const winners = new Map<string, Field>();
+function isRepeated(field: Field): boolean {
+    return field.def ? field.def.cardinality === 'repeated' : field.values.length > 1;
+}
+
+/**
+ * The effective values of each field after replaying its singular
+ * occurrences in wire order. A field cleared by a later oneof member is absent.
+ */
+function resolveFields(message: Message): Map<number, Value[]> {
+    const result = new Map<number, Value[]>();
+    const events: { field: Field; index: number; offset: number }[] = [];
     for (const field of message.fields.values()) {
+        if (isRepeated(field)) {
+            result.set(field.number, [...field.values]);
+            continue;
+        }
+        field.values.forEach((_, index) => events.push({ field, index, offset: field.raw[index]?.range.start ?? index }));
+    }
+    events.sort((a, b) => a.offset - b.offset);
+
+    for (const { field, index } of events) {
+        const value = field.values[index]!;
         const oneof = field.def?.oneof;
-        if (oneof === undefined) continue;
-        const current = winners.get(oneof);
-        if (!current || lastOffset(field) > lastOffset(current)) winners.set(oneof, field);
+        if (oneof !== undefined) {
+            for (const other of message.fields.values()) {
+                if (other !== field && other.def?.oneof === oneof) result.delete(other.number);
+            }
+        }
+        const existing = result.get(field.number)?.[0];
+        result.set(field.number, [
+            existing?.kind === 'message' && value.kind === 'message'
+                ? { kind: 'message', value: mergeMessages(existing.value, value.value) }
+                : value
+        ]);
     }
-    return winners;
+    return result;
 }
 
-function lastOffset(field: Field): number {
-    const last = field.raw[field.raw.length - 1];
-    return last ? last.range.start : -1;
-}
-
-function fieldToPlain(field: Field, options: ToObjectOptions): PlainValue {
-    const repeated = field.def ? field.def.cardinality === 'repeated' : field.values.length > 1;
-    if (repeated) return field.values.map(v => valueToPlain(v, options));
-
-    const last = field.values[field.values.length - 1];
-    if (last === undefined) return [];
-    if (field.values.length === 1 || last.kind !== 'message') return valueToPlain(last, options);
-
-    let merged: PlainValue = {};
-    for (const value of field.values) {
-        merged = merge(merged, valueToPlain(value, options));
+/**
+ * Joins two occurrences of one message so that resolving the result replays
+ * both in wire order. Earlier occurrences sit earlier in the input, so their
+ * records keep their precedence by offset.
+ */
+function mergeMessages(base: Message, next: Message): Message {
+    const fields = new Map<number, Field>(base.fields);
+    for (const [number, field] of next.fields) {
+        const existing = fields.get(number);
+        fields.set(number, existing ? {
+            number,
+            name: existing.name,
+            def: existing.def,
+            values: [...existing.values, ...field.values],
+            raw: [...existing.raw, ...field.raw],
+            alternatives: []
+        } : field);
     }
-    return merged;
+    return { type: base.type, fields };
 }
 
 function valueToPlain(value: Value, options: ToObjectOptions): PlainValue {
@@ -79,20 +110,4 @@ function valueToPlain(value: Value, options: ToObjectOptions): PlainValue {
         }
         default: return value.value;
     }
-}
-
-function isPlainObject(value: PlainValue): value is PlainObject {
-    return typeof value === 'object' && !Array.isArray(value) && !(value instanceof Uint8Array);
-}
-
-function merge(base: PlainValue, next: PlainValue): PlainValue {
-    if (!isPlainObject(base) || !isPlainObject(next)) return next;
-    const result: PlainObject = { ...base };
-    for (const [key, value] of Object.entries(next)) {
-        const existing = result[key];
-        if (existing === undefined) result[key] = value;
-        else if (Array.isArray(existing) && Array.isArray(value)) result[key] = [...existing, ...value];
-        else result[key] = merge(existing, value);
-    }
-    return result;
 }

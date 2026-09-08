@@ -197,6 +197,15 @@ describe('decode without a schema', () => {
             .to.deep.equal([{ kind: 'float', value: 0 }, { kind: 'float', value: 0 }, { kind: 'float', value: 100.25 }, { kind: 'float', value: 2.5 }]);
     });
 
+    it('does not read pairs of packed floats as doubles', () => {
+        const chunks = decode(hex('0a 08 00 00 00 bf 00 00 20 40 0a 08 00 00 00 00 00 00 80 3f'));
+        expect(chunks.message.fields.get(1)!.values).to.deep.equal([
+            { kind: 'float', value: -0.5 }, { kind: 'float', value: 2.5 }, { kind: 'float', value: 0 }, { kind: 'float', value: 1 }
+        ]);
+        expect(field(hex('0a 10 00 00 00 00 00 00 f8 3f 00 00 00 00 00 00 04 40'), 1).values)
+            .to.deep.equal([{ kind: 'double', value: 1.5 }, { kind: 'double', value: 2.5 }]);
+    });
+
     it('accepts wide values in packed varint lists', () => {
         const input = lenField(7, concat(varint(2n ** 53n + 1n), varint(0), varint(2n ** 53n + 1n), varint(-(2n ** 53n + 1n))));
         expect(field(input, 7).values.map(v => v.kind === 'int64' && v.value)).to.deep.equal([2n ** 53n + 1n, 0n, 2n ** 53n + 1n, -(2n ** 53n + 1n)]);
@@ -367,6 +376,42 @@ describe('decode without a schema', () => {
         expect(toObject(decode(lenField(1, payload)).message)).to.deep.equal({ '1': payload });
     });
 
+    it('accumulates packed evidence across chunk boundaries', () => {
+        // Two single-element chunks carry the same evidence as one two-element chunk
+        const split = decode(hex('0a 04 00 00 80 3f 0a 04 00 00 20 40'));
+        expectNoProblems(split.problems);
+        expect(split.message.fields.get(1)!.values).to.deep.equal([{ kind: 'float', value: 1 }, { kind: 'float', value: 2.5 }]);
+        expect(toObject(split.message)).to.deep.equal(toObject(decode(hex('0a 08 00 00 80 3f 00 00 20 40')).message));
+    });
+
+    it('lets unpacked records settle how packed chunks are read', () => {
+        const empty = decode(hex('08 01 0a 00'));
+        expectNoProblems(empty.problems);
+        expect(toObject(empty.message)).to.deep.equal({ '1': [1n] });
+
+        const text = decode(hex('08 01 0a 02 41 42'));
+        expectNoProblems(text.problems);
+        expect(toObject(text.message)).to.deep.equal({ '1': [1n, 65n, 66n] });
+    });
+
+    it('accepts zero-extended length prefixes', () => {
+        const result = decode(hex('0a 81 80 80 80 80 80 80 00 41'));
+        expectNoProblems(result.problems);
+        expect(toObject(result.message)).to.deep.equal({ '1': 'A' });
+    });
+
+    it('reports the recursion limit only for content that is really a message, with its position', () => {
+        const leaf = decode(hex('0a 07 12 05 68 65 6c 6c 6f'), { recursionLimit: 1 });
+        expectNoProblems(leaf.problems);
+        expect(toObject(leaf.message)).to.deep.equal({ '1': { '2': 'hello' } });
+
+        const deeper = decode(hex('0a 04 0a 02 08 01'), { recursionLimit: 1 });
+        const problem = expectProblem(deeper.problems, 'recursion-limit', 2);
+        expect(problem.path).to.deep.equal([1, 1]);
+        const inner = (deeper.message.fields.get(1)!.values[0] as Value & { kind: 'message' }).value;
+        expect(inner.fields.get(1)!.values[0]!.kind).to.not.equal('message');
+    });
+
     it('decodes packed alternatives as values, not raw records', () => {
         const f = field(lenField(1, 'hello'), 1);
         const packed = f.alternatives.find(a => a.packed);
@@ -526,6 +571,40 @@ describe('decode with a schema', () => {
     it('preserves a leading byte order mark in string fields', () => {
         const text = schema([messageType('S', [fieldDef({ number: 1, name: 's', type: scalar('string') })])]);
         expect(toObject(decode(hex('0a 06 ef bb bf 61 62 63'), { schema: text }).message)).to.deep.equal({ s: '\ufeffabc' });
+    });
+
+    it('infers one shared definition for an unknown field across all instances of its type', () => {
+        const rows = schema([
+            messageType('T', [fieldDef({ number: 1, name: 'rows', type: { kind: 'message', name: 'Row' }, cardinality: 'repeated' })]),
+            messageType('Row', [])
+        ]);
+        const messageAlt = (row: Value) => {
+            expect(row.kind).to.equal('message');
+            const f = (row as Value & { kind: 'message' }).value.fields.get(1)!;
+            return f.alternatives.find(a => a.type.kind === 'message')!;
+        };
+
+        const single = decode(hex('0a 07 0a 05 6d 61 62 63 64'), { schema: rows, type: 'T' });
+        const singleAlt = messageAlt(single.message.fields.get(1)!.values[0]!);
+        expect(singleAlt.values[0]!.kind).to.equal('message');
+        expect(toObject((singleAlt.values[0] as Value & { kind: 'message' }).value)).to.deep.equal({ '13': 1684234849n });
+
+        const both = decode(hex('0a 07 0a 05 6d 61 62 63 64 0a 04 0a 02 68 41'), { schema: rows, type: 'T' });
+        const [first, second] = both.message.fields.get(1)!.values as (Value & { kind: 'message' })[];
+        // Reading the second row's alternatives first must not change the first row's
+        const secondAlt = messageAlt(second!);
+        const firstAlt = messageAlt(first!);
+        expect(firstAlt.type).to.deep.equal(secondAlt.type);
+        expect(first!.value.fields.get(1)!.def).to.equal(second!.value.fields.get(1)!.def);
+        expect([...both.schema.types.keys()].filter(k => k.startsWith('Row.'))).to.deep.equal(['Row.Field1']);
+        for (const alt of [firstAlt, secondAlt]) expect(alt.values[0]!.kind).to.equal('message');
+    });
+
+    it('adds inferred fields to the types they were found in, in the returned schema', () => {
+        const result = decode(concat(person, varintField(99, 5)), { schema: testSchema, type: 'test.Person' });
+        const extended = result.schema.types.get('test.Person') as MessageType;
+        expect(extended.fields.get(99)!.type).to.deep.equal(scalar('int64'));
+        expect((testSchema.types.get('test.Person') as MessageType).fields.has(99)).to.equal(false);
     });
 
     it('never lets an inferred type replace a supplied one with the same name', () => {

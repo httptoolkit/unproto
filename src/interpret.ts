@@ -20,10 +20,68 @@ import { Inferrer } from './infer.ts';
 export interface InterpretContext {
     /** All known types. Types inferred for unknown fields are added here. */
     readonly types: Map<string, NamedType>;
-    /** Names in `types` that were inferred rather than supplied, so inference may replace them */
+    /** Names in `types` that were inferred rather than supplied */
     readonly inferred: Set<string>;
+    /** Definitions inferred for fields the schema lacks, by containing type name then field number */
+    readonly extensions: Map<string, Map<number, FieldDef>>;
     readonly problems: Problem[];
     readonly recursionLimit: number;
+}
+
+/** The occurrences of one undefined field across every instance of its containing type */
+export interface UnknownFieldGroup {
+    readonly typeName: string;
+    readonly number: number;
+    /** Depth and path of the first containing message instance seen */
+    readonly depth: number;
+    readonly path: readonly number[];
+    readonly perSample: WireField[][];
+}
+
+/**
+ * Walks a message with its schema and collects every field the schema does
+ * not define, grouped by containing type and number with one sample per
+ * containing message instance, so that each can be inferred once from all
+ * of its occurrences together.
+ */
+export function collectUnknownFields(
+    fields: readonly WireField[],
+    type: MessageType,
+    ctx: InterpretContext,
+    path: readonly number[],
+    depth: number,
+    groups: Map<string, UnknownFieldGroup>
+): void {
+    const unknownHere = new Map<number, WireField[]>();
+    const quiet: InterpretContext = { ...ctx, problems: [] };
+    for (const occ of fields) {
+        const def = type.fields.get(occ.number);
+        if (!def) {
+            const list = unknownHere.get(occ.number);
+            if (list) list.push(occ);
+            else unknownHere.set(occ.number, [occ]);
+            continue;
+        }
+        if ((def.type.kind !== 'message' && def.type.kind !== 'map') || depth >= ctx.recursionLimit) continue;
+        const nestedType = resolveMessageType(def.type, quiet, path);
+        if (!nestedType) continue;
+        const nestedPath = [...path, occ.number];
+        if (occ.kind === 'len') {
+            const wire = decodeWire(occ.bytes, { offset: occ.valueRange.start, recursionLimit: ctx.recursionLimit });
+            collectUnknownFields(wire.fields, nestedType, ctx, nestedPath, depth + 1, groups);
+        } else if (occ.kind === 'group') {
+            collectUnknownFields(occ.fields, nestedType, ctx, nestedPath, depth + 1, groups);
+        }
+    }
+    for (const [number, occurrences] of unknownHere) {
+        const key = `${type.fullName}#${number}`;
+        let group = groups.get(key);
+        if (!group) {
+            group = { typeName: type.fullName, number, depth, path, perSample: [] };
+            groups.set(key, group);
+        }
+        group.perSample.push(occurrences);
+    }
 }
 
 /** Decodes a list of wire fields as a message of the given type (or heuristically if none). */
@@ -45,17 +103,19 @@ export function interpretMessage(
     for (const [number, occurrences] of grouped) {
         const fieldPath = [...path, number];
         let def = type?.fields.get(number);
+        if (!def && type) {
+            ctx.problems.push({
+                code: 'unknown-field',
+                message: `Field ${number} is not defined in ${type.fullName}`,
+                offset: occurrences[0]!.range.start,
+                path: fieldPath
+            });
+            def = ctx.extensions.get(type.fullName)?.get(number);
+        }
         if (!def) {
-            if (type) {
-                ctx.problems.push({
-                    code: 'unknown-field',
-                    message: `Field ${number} is not defined in ${type.fullName}`,
-                    offset: occurrences[0]!.range.start,
-                    path: fieldPath
-                });
-            }
+            // Only reached for fields of types the schema does not define at all
             const inferrer = new Inferrer(ctx.types, ctx.recursionLimit, ctx.inferred, ctx.problems);
-            def = inferrer.inferField(number, [occurrences], type?.fullName ?? 'Unknown', depth);
+            def = inferrer.inferField(number, [occurrences], type?.fullName ?? 'Unknown', depth, path);
         }
         out.set(number, interpretField(occurrences, def, ctx, fieldPath, depth));
     }

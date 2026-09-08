@@ -41,15 +41,20 @@ const MAX_NESTED_CHECKS = 8;
  */
 export type AnalysisCache = WeakMap<Uint8Array, LenAnalysis>;
 
-export function analyzeLen(bytes: Uint8Array, depth: number, recursionLimit: number, cache: AnalysisCache): LenAnalysis {
+/**
+ * Analyses a length-delimited payload. `offset` is the payload's absolute
+ * position in the original input, so that the wire records of a candidate
+ * message report absolute positions too.
+ */
+export function analyzeLen(bytes: Uint8Array, offset: number, depth: number, recursionLimit: number, cache: AnalysisCache): LenAnalysis {
     if (bytes.length === 0) return { length: 0 };
     const cached = cache.get(bytes);
     if (cached) return cached;
 
     let message: LenAnalysis['message'];
     if (depth < recursionLimit) {
-        const wire = decodeWire(bytes);
-        if (wire.problems.length === 0 && wire.trailing === undefined && wire.fields.length > 0) {
+        const wire = decodeWire(bytes, { offset });
+        if (isWellFormed(wire)) {
             message = { wire, score: scoreMessage(wire, bytes.length, depth, recursionLimit, cache) };
         }
     }
@@ -72,6 +77,11 @@ export function analyzeLen(bytes: Uint8Array, depth: number, recursionLimit: num
     };
     cache.set(bytes, analysis);
     return analysis;
+}
+
+/** Whether every byte was consumed by valid, balanced fields, with at least one field */
+export function isWellFormed(wire: WireMessage): boolean {
+    return wire.problems.length === 0 && wire.trailing === undefined && wire.fields.length > 0;
 }
 
 /** The best score of any reading other than opaque bytes, or 0 if there is none */
@@ -147,7 +157,7 @@ function scoreMessage(wire: WireMessage, payloadLength: number, depth: number, r
         if (field.kind === 'varint' && field.nonCanonical) hasNonCanonical = true;
         if (field.kind === 'len' && field.bytes.length > 0 && nestedChecked < MAX_NESTED_CHECKS) {
             nestedChecked++;
-            const best = bestNonBytesScore(analyzeLen(field.bytes, depth + 1, recursionLimit, cache));
+            const best = bestNonBytesScore(analyzeLen(field.bytes, field.valueRange.start, depth + 1, recursionLimit, cache));
             if (best >= 0.7) coveredBytes += field.bytes.length;
             else if (best > BYTES_SCORE) coveredBytes += field.bytes.length / 2;
             else nestedPenalty = Math.min(0.2, nestedPenalty + 0.1);
@@ -177,7 +187,7 @@ function scoreMessage(wire: WireMessage, payloadLength: number, depth: number, r
 
 // Classifies the varints in a payload from their byte lengths alone, without
 // materialising values: a canonical varint of n bytes is at least 2^(7(n-1)).
-function analyzePackedVarints(bytes: Uint8Array): LenAnalysis['packedVarint'] {
+export function analyzePackedVarints(bytes: Uint8Array): PackedCandidate | undefined {
     let pos = 0;
     let count = 0;
     let zeros = 0;
@@ -228,7 +238,7 @@ function isPrintableAscii(byte: number): boolean {
 // "Small" means the top byte (fixed32) or top four bytes (fixed64) carry only sign
 const SMALL_INT_LIMIT = { 4: 2n ** 23n, 8: 2n ** 31n } as const;
 
-function analyzePackedFixed(bytes: Uint8Array, size: 4 | 8): LenAnalysis['packedI32'] {
+export function analyzePackedFixed(bytes: Uint8Array, size: 4 | 8): PackedCandidate | undefined {
     if (bytes.length % size !== 0 || bytes.length === 0) return undefined;
     const count = bytes.length / size;
     if (count === 1) return { count, score: NEUTRAL_SCORE, neutral: true };
@@ -237,13 +247,19 @@ function analyzePackedFixed(bytes: Uint8Array, size: 4 | 8): LenAnalysis['packed
     let anyZero = false;
     let allSmallInts = true;
     let cleanLowWords = true;
+    let halvesAreFloats = true;
     for (let i = 0; i < count; i++) {
         const value = size === 4 ? view.getFloat32(i * size, true) : view.getFloat64(i * size, true);
         if (!isReasonableFloat(value, size)) allReasonableFloats = false;
         if (value === 0) anyZero = true;
         const int = size === 4 ? BigInt(view.getInt32(i * size, true)) : view.getBigInt64(i * size, true);
         if (int >= SMALL_INT_LIMIT[size] || int < -SMALL_INT_LIMIT[size]) allSmallInts = false;
-        if (size === 8 && view.getUint32(i * size, true) !== 0) cleanLowWords = false;
+        if (size === 8) {
+            if (view.getUint32(i * size, true) !== 0) cleanLowWords = false;
+            if (!isReasonableFloat(view.getFloat32(i * size, true), 4) || !isReasonableFloat(view.getFloat32(i * size + 4, true), 4)) {
+                halvesAreFloats = false;
+            }
+        }
     }
     // A run of plausible non-zero floats is strong evidence; zeros are ambiguous with varints.
     // Small integers are a decent sign too: random bytes rarely have their high bytes clear.
@@ -255,6 +271,9 @@ function analyzePackedFixed(bytes: Uint8Array, size: 4 | 8): LenAnalysis['packed
         : allSmallInts ? 0.45
         : 0.25;
     if (size === 8 && score > 0.25 && (allReasonableFloats ? cleanLowWords : true)) score += 0.02;
+    // Two floats glued together read as a double whose low word is itself a plausible float;
+    // a genuine double with significant low bits almost never splits that way
+    if (size === 8 && allReasonableFloats && !cleanLowWords && halvesAreFloats) score -= 0.15;
     return { count, score };
 }
 

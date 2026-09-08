@@ -35,6 +35,24 @@ describe('toObject', () => {
         expect(JSON.parse(json)).to.deep.equal({ '1': '5', '2': 'x', '3': { '1': '1' }, '4': 'bytes(2)' });
     });
 
+    it('replays oneof members and message merges in wire order', () => {
+        const oneofs = schema([
+            messageType('T', [
+                fieldDef({ number: 1, name: 'a', type: { kind: 'message', name: 'M' }, oneof: 'choice' }),
+                fieldDef({ number: 2, name: 'b', type: scalar('int32'), oneof: 'choice' })
+            ]),
+            messageType('M', [
+                fieldDef({ number: 1, name: 'x', type: scalar('int32') }),
+                fieldDef({ number: 2, name: 'y', type: scalar('int32') })
+            ]),
+            messageType('Outer', [fieldDef({ number: 1, name: 't', type: { kind: 'message', name: 'T' } })])
+        ]);
+        // a = {x: 1}, then b = 1 (clears a), then a = {y: 2} starts afresh
+        expect(toObject(decode(hex('0a 02 08 01 10 01 0a 02 10 02'), { schema: oneofs, type: 'T' }).message)).to.deep.equal({ a: { y: 2n } });
+        // t = {a: {x: 1}} merged with t = {b: 7}: b clears a inside the merged message
+        expect(toObject(decode(hex('0a 04 0a 02 08 01 0a 02 10 07'), { schema: oneofs, type: 'Outer' }).message)).to.deep.equal({ t: { b: 7n } });
+    });
+
     it('keeps only the last-written member of a oneof', () => {
         const choice = schema([messageType('O', [
             fieldDef({ number: 3, name: 'a', type: scalar('int32'), oneof: 'c' }),

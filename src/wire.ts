@@ -130,20 +130,19 @@ interface SmallVarint {
 
 /**
  * Reads a varint that must fit in 32 bits (a tag or a length) without
- * allocating a bigint. Anything needing more than seven bytes is at least
- * 2^49 and reported as 'too-large' rather than decoded.
+ * allocating a bigint. Payload bits beyond the seventh byte mean a value
+ * of at least 2^49, reported as 'too-large'; bytes that only pad the
+ * encoding with zero groups are accepted and flagged as non-canonical.
  */
 export function readSmallVarint(input: Uint8Array, pos: number, end: number): SmallVarint | 'truncated' | 'too-long' | 'too-large' {
     let value = 0;
-    for (let i = 0; i < 7; i++) {
+    for (let i = 0; i < 10; i++) {
         if (pos + i >= end) return 'truncated';
         const b = input[pos + i]!;
-        value += (b & 0x7f) * VARINT_SHIFT[i]!;
-        if (b < 0x80) return { value, length: i + 1, nonCanonical: i > 0 && b === 0 };
-    }
-    for (let i = 7; i < 10; i++) {
-        if (pos + i >= end) return 'truncated';
-        if (input[pos + i]! < 0x80) return 'too-large';
+        const payload = b & 0x7f;
+        if (i < 7) value += payload * VARINT_SHIFT[i]!;
+        else if (payload !== 0) return 'too-large';
+        if (b < 0x80) return { value, length: i + 1, nonCanonical: i > 0 && payload === 0 };
     }
     return 'too-long';
 }
