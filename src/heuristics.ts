@@ -107,7 +107,8 @@ function scoreMessage(wire: WireMessage, depth: number, recursionLimit: number):
             nestedChecked++;
             const best = bestNonBytesScore(analyzeLen(field.bytes, depth + 1, recursionLimit));
             if (best >= 0.7) nestedBonus = Math.min(0.2, nestedBonus + 0.1);
-            else if (best < 0.4) nestedPenalty = Math.min(0.2, nestedPenalty + 0.1);
+            else if (best > BYTES_SCORE) nestedBonus = Math.min(0.2, nestedBonus + 0.05);
+            else nestedPenalty = Math.min(0.2, nestedPenalty + 0.1);
         }
     }
 
@@ -128,10 +129,14 @@ function scoreMessage(wire: WireMessage, depth: number, recursionLimit: number):
 function analyzePackedVarints(bytes: Uint8Array): LenAnalysis['packedVarint'] {
     let pos = 0;
     let count = 0;
+    let zeros = 0;
+    let wide = 0;
     let large = false;
     while (pos < bytes.length) {
         const varint = readVarint(bytes, pos, bytes.length);
         if (varint === 'truncated' || varint === 'too-long' || varint.nonCanonical || varint.overflow) return undefined;
+        if (varint.value === 0n) zeros++;
+        if (varint.value >= 0x200000n) wide++;
         if (varint.value >= 0x100000000n && varint.value < 0x8000000000000000n) large = true;
         pos += varint.length;
         count++;
@@ -139,9 +144,16 @@ function analyzePackedVarints(bytes: Uint8Array): LenAnalysis['packedVarint'] {
     if (count < 2) return undefined;
     let score = 0.4;
     if (count >= 3) score += 0.1;
-    if (large) score -= 0.1;
+    // Little-endian fixed-width integers read as varints produce runs of zeros
+    if (count >= 3 && bytes.length % 4 === 0 && zeros * 3 >= count) score -= 0.1;
+    // Random binary that happens to parse as varints gives mostly wide values
+    if (wide * 2 > count) score -= 0.15;
+    else if (large) score -= 0.1;
     return { count, score };
 }
+
+// "Small" means the top byte (fixed32) or top four bytes (fixed64) carry only sign
+const SMALL_INT_LIMIT = { 4: 2n ** 23n, 8: 2n ** 31n } as const;
 
 function analyzePackedFixed(bytes: Uint8Array, size: 4 | 8): LenAnalysis['packedI32'] {
     if (bytes.length % size !== 0 || bytes.length < size * 2) return undefined;
@@ -149,13 +161,26 @@ function analyzePackedFixed(bytes: Uint8Array, size: 4 | 8): LenAnalysis['packed
     const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
     let allReasonableFloats = true;
     let anyZero = false;
+    let allSmallInts = true;
+    let cleanLowWords = true;
     for (let i = 0; i < count; i++) {
         const value = size === 4 ? view.getFloat32(i * size, true) : view.getFloat64(i * size, true);
-        if (!isReasonableFloat(value, size)) { allReasonableFloats = false; break; }
+        if (!isReasonableFloat(value, size)) allReasonableFloats = false;
         if (value === 0) anyZero = true;
+        const int = size === 4 ? BigInt(view.getInt32(i * size, true)) : view.getBigInt64(i * size, true);
+        if (int >= SMALL_INT_LIMIT[size] || int < -SMALL_INT_LIMIT[size]) allSmallInts = false;
+        if (size === 8 && view.getUint32(i * size, true) !== 0) cleanLowWords = false;
     }
-    // A run of plausible non-zero floats is strong evidence; zeros are ambiguous with varints
-    const score = !allReasonableFloats ? 0.25 : anyZero ? 0.45 : 0.55;
+    // A run of plausible non-zero floats is strong evidence; zeros are ambiguous with varints.
+    // Small integers are a decent sign too: random bytes rarely have their high bytes clear.
+    // The same bytes often read plausibly at both widths, so the 64-bit reading gets a
+    // nudge exactly when its shape says so: doubles with few significant bits have empty
+    // low words, and small 64-bit integers have empty high words (which the 32-bit reading
+    // would show as interleaved zeros).
+    let score = allReasonableFloats ? (anyZero ? 0.45 : 0.55)
+        : allSmallInts ? 0.45
+        : 0.25;
+    if (size === 8 && score > 0.25 && (allReasonableFloats ? cleanLowWords : true)) score += 0.02;
     return { count, score };
 }
 

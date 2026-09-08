@@ -133,6 +133,43 @@ describe('decode without a schema', () => {
         expect(f.def).to.deep.include({ packed: true });
     });
 
+    it('detects packed fixed-width integers by their empty high bytes', () => {
+        const fixed64 = field(hex('0a 18 01 00 00 00 00 00 00 00 d2 04 00 00 00 00 00 00 f9 ff ff ff ff ff ff ff'), 1);
+        expect(fixed64.values).to.deep.equal([
+            { kind: 'sfixed64', value: 1n }, { kind: 'sfixed64', value: 1234n }, { kind: 'sfixed64', value: -7n }
+        ]);
+        expect(fixed64.def).to.deep.include({ packed: true, cardinality: 'repeated' });
+
+        const fixed32 = field(hex('1a 08 fd ff ff ff 40 e2 01 00'), 3);
+        expect(fixed32.values).to.deep.equal([{ kind: 'sfixed32', value: -3n }, { kind: 'sfixed32', value: 123456n }]);
+
+        const unsigned = field(hex('1a 08 e8 03 00 00 40 e2 01 00'), 3);
+        expect(unsigned.values).to.deep.equal([{ kind: 'fixed32', value: 1000n }, { kind: 'fixed32', value: 123456n }]);
+    });
+
+    it('tells packed doubles and packed floats apart by their bit patterns', () => {
+        expect(field(hex('3a 10 00 00 00 00 00 00 00 00 00 00 00 00 00 00 f8 bf'), 7).values)
+            .to.deep.equal([{ kind: 'double', value: 0 }, { kind: 'double', value: -1.5 }]);
+        expect(field(hex('32 10 00 00 00 00 00 00 00 00 00 80 c8 42 00 00 20 40'), 6).values)
+            .to.deep.equal([{ kind: 'float', value: 0 }, { kind: 'float', value: 0 }, { kind: 'float', value: 100.25 }, { kind: 'float', value: 2.5 }]);
+    });
+
+    it('accepts wide values in packed varint lists', () => {
+        const input = lenField(7, concat(varint(2n ** 53n + 1n), varint(0), varint(2n ** 53n + 1n), varint(-(2n ** 53n + 1n))));
+        expect(field(input, 7).values.map(v => v.kind === 'int64' && v.value)).to.deep.equal([2n ** 53n + 1n, 0n, 2n ** 53n + 1n, -(2n ** 53n + 1n)]);
+    });
+
+    it('reads a short run of random bytes as bytes rather than wide varints', () => {
+        const payload = hex('d9 a9 c2 05 9e b2 c1 06');
+        expect(field(lenField(1, payload), 1).values).to.deep.equal([{ kind: 'bytes', value: payload }]);
+    });
+
+    it('judges a repeated field by its least convincing occurrence', () => {
+        // "'P" alone would be a fine string, but "\x13" is not, so both are bytes
+        const input = concat(lenField(20, hex('27 50')), lenField(20, hex('13')));
+        expect(toObject(decode(input).message)).to.deep.equal({ '20': [hex('27 50'), hex('13')] });
+    });
+
     it('keeps every value of a repeated field, including a falsy first one', () => {
         expect(toObject(decode(hex('08 00 08 05')).message)).to.deep.equal({ '1': [0n, 5n] });
     });

@@ -38,7 +38,7 @@ export function inferSchemaFromWire(samples: readonly WireMessage[], options: In
 }
 
 type Candidate = 'message' | 'string' | 'packedVarint' | 'packedI64' | 'packedI32' | 'bytes';
-const CANDIDATE_ORDER: readonly Candidate[] = ['string', 'message', 'packedVarint', 'packedI64', 'packedI32', 'bytes'];
+const CANDIDATE_ORDER: readonly Candidate[] = ['string', 'message', 'packedVarint', 'packedI32', 'packedI64', 'bytes'];
 
 export class Inferrer {
     /** Set when the data uses group encoding, which proto3 cannot express */
@@ -231,7 +231,8 @@ interface PackedEvidence {
 /**
  * Combines per-occurrence analyses into an ordered list of candidate
  * readings for the field as a whole. A reading must be possible for every
- * non-empty occurrence; its score is the mean over those occurrences.
+ * non-empty occurrence, and its score is its worst score among them, so
+ * one convincing occurrence cannot carry an unconvincing one.
  */
 function rankCandidates(analyses: readonly LenAnalysis[], evidence: PackedEvidence): Candidate[] {
     const nonEmpty = analyses.filter(a => a.length > 0);
@@ -241,13 +242,13 @@ function rankCandidates(analyses: readonly LenAnalysis[], evidence: PackedEviden
     scores.set('bytes', BYTES_SCORE);
 
     const consider = (candidate: Candidate, score: (a: LenAnalysis) => number | undefined, boost: number) => {
-        let total = 0;
+        let worst = 1;
         for (const analysis of nonEmpty) {
             const value = score(analysis);
             if (value === undefined) return;
-            total += value;
+            worst = Math.min(worst, value);
         }
-        scores.set(candidate, total / nonEmpty.length + boost);
+        scores.set(candidate, worst + boost);
     };
 
     consider('message', a => a.message?.score, 0);
