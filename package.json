@@ -25,7 +25,8 @@
   "types": "dist/index.d.ts",
   "sideEffects": false,
   "files": [
-    "dist"
+    "dist",
+    "src"
   ],
   "engines": {
     "node": ">=22.18.0"
