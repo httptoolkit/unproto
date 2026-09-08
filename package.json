@@ -1,0 +1,48 @@
+{
+  "name": "unproto",
+  "version": "0.0.0",
+  "description": "With no schema, decode protobuf, infer a schema, test it, and re-encode again to reverse engineer protobuf from real HTTP traffic",
+  "keywords": [
+    "protobuf",
+    "protocol-buffers",
+    "decode",
+    "schema",
+    "reverse-engineering",
+    "grpc"
+  ],
+  "homepage": "https://github.com/httptoolkit/unproto#readme",
+  "bugs": {
+    "url": "https://github.com/httptoolkit/unproto/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/httptoolkit/unproto.git"
+  },
+  "license": "Apache-2.0",
+  "author": "Tim Perry <tim@httptoolkit.com>",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "sideEffects": false,
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "prepack": "npm run build",
+    "test": "npm run test:types && mocha",
+    "test:types": "tsc -p tsconfig.test.json"
+  },
+  "devDependencies": {
+    "@types/chai": "^5.2.3",
+    "@types/mocha": "^10.0.10",
+    "@types/node": "^22.20.1",
+    "chai": "^6.2.2",
+    "mocha": "^12.0.0",
+    "protobufjs": "^8.8.0",
+    "typescript": "^7.0.2"
+  }
+}
