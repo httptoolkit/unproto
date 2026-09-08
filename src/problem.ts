@@ -17,7 +17,13 @@ export type ProblemCode =
     | 'wire-type-mismatch'
     | 'invalid-utf8'
     | 'invalid-packed-data'
-    | 'nested-message-problems';
+    | 'nested-message-problems'
+    // Schema problems
+    | 'parse-error'
+    | 'unsupported'
+    | 'unresolved-type'
+    | 'duplicate-name'
+    | 'invalid-value';
 
 /**
  * A non-fatal issue found while decoding. Decoding never throws for bad

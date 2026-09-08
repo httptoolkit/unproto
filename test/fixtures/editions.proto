@@ -1,0 +1,12 @@
+edition = "2023";
+package t;
+option features.field_presence = IMPLICIT;
+
+message M {
+  int32 implicit_by_file = 1;
+  int32 explicit_here = 2 [features.field_presence = EXPLICIT];
+  repeated int32 packed_default = 3;
+  repeated int32 expanded = 4 [features.repeated_field_encoding = EXPANDED];
+  N delimited = 5 [features.message_encoding = DELIMITED];
+  message N { int32 x = 1; }
+}

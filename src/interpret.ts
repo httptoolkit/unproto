@@ -385,7 +385,10 @@ function resolveMessageType(
     entryName: string
 ): MessageType {
     if (type.kind === 'map') {
-        return {
+        const existing = ctx.types.get(entryName);
+        if (existing?.kind === 'message') return existing;
+        // Registered so that anything inferred inside an entry has a type to belong to
+        const entry: MessageType = {
             kind: 'message',
             name: entryName.slice(entryName.lastIndexOf('.') + 1),
             fullName: entryName,
@@ -397,6 +400,8 @@ function resolveMessageType(
             mapEntry: true,
             messageSet: false
         };
+        ctx.types.set(entryName, entry);
+        return entry;
     }
     const resolved = ctx.types.get(type.name);
     if (resolved?.kind === 'message') return resolved;

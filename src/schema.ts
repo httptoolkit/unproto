@@ -14,6 +14,48 @@ export type FieldType =
 
 export type Cardinality = 'optional' | 'required' | 'repeated';
 
+/** An inclusive range of field or enum numbers */
+export interface NumberRange {
+    readonly start: number;
+    /** Inclusive. `MAX_FIELD_NUMBER` stands for the `max` keyword. */
+    readonly end: number;
+}
+
+/** An option as written. Values are kept as source text, uninterpreted. */
+export interface OptionDecl {
+    /** Including any parentheses and dots, e.g. `(my.custom).nested` */
+    readonly name: string;
+    readonly value: string;
+}
+
+export interface ImportDecl {
+    readonly path: string;
+    readonly kind: 'default' | 'public' | 'weak' | 'option';
+}
+
+export interface MethodDecl {
+    readonly name: string;
+    readonly inputType: string;
+    readonly outputType: string;
+    readonly clientStreaming: boolean;
+    readonly serverStreaming: boolean;
+    readonly options?: readonly OptionDecl[];
+}
+
+export interface ServiceDecl {
+    readonly name: string;
+    readonly fullName: string;
+    readonly methods: readonly MethodDecl[];
+    readonly options?: readonly OptionDecl[];
+}
+
+/** A field declared on another message by an `extend` block */
+export interface ExtensionDecl {
+    /** Full name of the message being extended */
+    readonly extendee: string;
+    readonly field: FieldDef;
+}
+
 /** Whether an unset field is distinguishable from one set to its default value */
 export type Presence = 'explicit' | 'implicit';
 
@@ -47,6 +89,8 @@ export interface FieldDef {
     readonly defaultValue?: string;
     /** Present only on fields whose definition was inferred from data */
     readonly inferred?: InferenceNotes;
+    /** Options that do not affect decoding, kept so that they survive a round trip */
+    readonly options?: readonly OptionDecl[];
 }
 
 export interface MessageType {
@@ -58,6 +102,10 @@ export interface MessageType {
     readonly oneofs: readonly string[];
     readonly mapEntry: boolean;
     readonly messageSet: boolean;
+    readonly reservedRanges?: readonly NumberRange[];
+    readonly reservedNames?: readonly string[];
+    readonly extensionRanges?: readonly NumberRange[];
+    readonly options?: readonly OptionDecl[];
 }
 
 export interface EnumValue {
@@ -72,15 +120,23 @@ export interface EnumType {
     readonly values: readonly EnumValue[];
     /** Open enums accept unknown numbers; closed ones treat them as unknown fields */
     readonly open: boolean;
+    readonly reservedRanges?: readonly NumberRange[];
+    readonly reservedNames?: readonly string[];
+    readonly options?: readonly OptionDecl[];
 }
 
 export type NamedType = MessageType | EnumType;
 
 export interface Schema {
     readonly syntax: 'proto2' | 'proto3' | 'editions';
-    readonly edition?: '2023' | '2024' | '2026';
+    /** The edition string when `syntax` is 'editions', e.g. '2023'. Not restricted, so that future editions parse. */
+    readonly edition?: string;
     readonly package?: string;
     readonly types: ReadonlyMap<string, NamedType>;
+    readonly imports?: readonly ImportDecl[];
+    readonly services?: readonly ServiceDecl[];
+    readonly extensions?: readonly ExtensionDecl[];
+    readonly options?: readonly OptionDecl[];
 }
 
 export const VARINT_SCALARS: ReadonlySet<ScalarType> = new Set<ScalarType>([

@@ -1,0 +1,22 @@
+syntax = "proto3";
+package cross;
+import "google/protobuf/timestamp.proto";
+
+message Sample {
+  int32 plain = 1;
+  optional int32 opt = 2;
+  repeated int32 packed = 3;
+  repeated int32 loose = 4 [packed = false];
+  string text = 5;
+  bytes blob = 6;
+  Kind kind = 7;
+  Nested nested = 8;
+  map<string, int32> counts = 9;
+  google.protobuf.Timestamp at = 10;
+  oneof pick { int32 x = 11; string y = 12; }
+  repeated Nested many = 13;
+  reserved 50 to 60;
+
+  message Nested { double d = 1; }
+  enum Kind { K_ZERO = 0; K_ONE = 1; }
+}

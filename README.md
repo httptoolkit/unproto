@@ -93,6 +93,42 @@ message SearchResponse {
 
 To refine a schema over time, edit the printed file (rename fields, narrow types), build a schema from it, and pass it back as `base`: supplied definitions are kept untouched and only the fields it lacks are inferred and added.
 
+### Use a real schema
+
+Point unproto at a schema you already have, either as `.proto` source or as a compiled descriptor set:
+
+```typescript
+import { parseProto, schemaFromDescriptorSet, decode, toObject } from 'unproto';
+
+// From .proto source (proto2, proto3 or any edition)
+const { schema, problems } = parseProto(await readFile('api.proto', 'utf8'));
+
+// Or from protoc descriptor_set_out, buf build, or gRPC server reflection:
+//   e.g. protoc --descriptor_set_out=api.pb --include_imports api.proto
+const fromDescriptor = schemaFromDescriptorSet(await readFile('api.pb'));
+
+toObject(decode(body, { schema, type: 'api.SearchResponse' }).message);
+```
+
+Descriptor sets are the more reliable route, because the build tool has already resolved every import into one self-contained file. Source parsing takes a single file: `google/protobuf/*.proto` imports resolve against bundled definitions, and any other import is reported as a problem with the types it would have provided left unresolved.
+
+Editions features are resolved through their lexical scopes either way, so a field's presence, packing and message encoding reflect what the file and its enclosing messages actually declare.
+
+Parsing never throws. A construct that cannot be read is skipped at the smallest possible granularity and reported in `problems`, so one bad field does not cost you the rest of the file.
+
+### Re-encode
+
+```typescript
+import { decode, encodeMessage, encodeObject } from 'unproto';
+
+// Re-encode a decoded message, reproducing the original bytes
+const result = decode(bytes);
+encodeMessage(result.message);
+
+// Encode edited data against a schema
+const { bytes: edited } = encodeObject({ id: 42n, name: 'Jane' }, schema, 'Person');
+```
+
 ### Check whether bytes are protobuf at all
 
 ```typescript
@@ -108,6 +144,10 @@ isValidProtobuf(bytes); // true if every byte is a well-formed field and there i
 - `SchemaInferrer`: accumulates messages of one type with `add(bytes)`; `schema()` infers from everything added so far, `problems()` lists issues. Options: `rootName`, `recursionLimit`, `base` (a schema to extend) and `type`.
 - `inferSchema(samples, options?)`: the same in one call.
 - `printProto(schema, options?)`: renders a schema as `.proto` text (proto3, or edition 2023 when group encoding was seen). Options: `header` comment lines, `indent`.
+- `parseProto(source, options?)`: parses `.proto` source into a schema, reporting rather than throwing. Options: `name` for problem messages, `strict`.
+- `schemaFromDescriptorSet(bytes, options?)`: reads a binary `FileDescriptorSet`. Options: `file` to choose which file supplies the package and syntax.
+- `encodeMessage(message, options?)`: re-encodes a decoded message. Options: `preserveEncoding`.
+- `encodeObject(object, schema, typeName?)`: encodes a plain object against a schema.
 - `isValidProtobuf(bytes)`: wire-level validity check.
 - `schema`, `messageType`, `enumType`, `fieldDef`, `scalar`: helpers for building schemas by hand.
 

@@ -1,0 +1,8 @@
+syntax = "proto2";
+package t2;
+message M2 {
+  required int32 req = 1;
+  optional group Grp = 2 { optional int32 x = 1; }
+  repeated int32 packed = 3 [packed=true];
+  repeated int32 unpacked = 4;
+}

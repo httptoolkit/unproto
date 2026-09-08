@@ -2,6 +2,7 @@ import { expect } from 'chai';
 import {
     decode,
     toObject,
+    printProto,
     schema,
     messageType,
     enumType,
@@ -654,6 +655,29 @@ describe('decode with a schema', () => {
         const start = performance.now();
         decode(many, { schema: rows, type: 'T' });
         expect(performance.now() - start).to.be.lessThan(2000);
+    });
+
+    it('keeps fields inferred inside a map entry attached to that entry', () => {
+        const maps = schema([messageType('M', [
+            fieldDef({ number: 1, name: 'a', type: { kind: 'map', key: 'string', value: scalar('int32') }, cardinality: 'repeated' })
+        ])]);
+        // One entry carrying an unknown field 3, whose payload is itself a message
+        const input = lenField(1, concat(lenField(1, 'k'), varintField(2, 1), lenField(3, varintField(1, 7))));
+        const result = decode(input, { schema: maps, type: 'M' });
+        expect(toObject(result.message)).to.deep.equal({ a: [{ key: 'k', value: 1n, '3': { '1': 7n } }] });
+
+        // The inferred field belongs to the entry type, and nothing is left dangling
+        const entry = result.schema.types.get('M.aEntry') as MessageType;
+        expect(entry.mapEntry).to.equal(true);
+        expect(entry.fields.get(3)!.type).to.deep.equal({ kind: 'message', name: 'M.aEntry.Field3' });
+        expect(printProto(result.schema)).to.equal([
+            'syntax = "proto3";',
+            '',
+            'message M {',
+            '  map<string, int32> a = 1;',
+            '}',
+            ''
+        ].join('\n'));
     });
 
     it('never lets an inferred type replace a supplied one with the same name', () => {
