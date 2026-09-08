@@ -113,6 +113,49 @@ describe('decode without a schema', () => {
         expect(field(lenField(2, payload), 2).values).to.deep.equal([{ kind: 'bytes', value: payload }]);
     });
 
+    it('survives a NUL terminator on otherwise ordinary text', () => {
+        expect(toObject(decode(lenField(1, 'session-token-abc123\0')).message)).to.deep.equal({ '1': 'session-token-abc123\0' });
+        expect(field(lenField(1, 'a\0b\0c\0d\0'), 1).values[0]!.kind).to.not.equal('string');
+    });
+
+    it('does not take ASCII text as evidence of packed varints', () => {
+        // Every byte below 0x80 is a valid one-byte varint, so text always parses as a packed list
+        const f = field(lenField(1, 'plain text'), 1);
+        expect(f.values[0]!.kind).to.equal('string');
+        const packed = f.alternatives.findIndex(a => a.packed);
+        const bytes = f.alternatives.findIndex(a => a.type.kind === 'scalar' && a.type.scalar === 'bytes');
+        expect(packed, 'packed varints should rank no better than bytes').to.be.greaterThan(bytes);
+    });
+
+    it('reports when nesting exceeds the recursion limit', () => {
+        let bytes = hex('08 01');
+        for (let i = 0; i < 5; i++) bytes = lenField(1, bytes);
+        const result = decode(bytes, { recursionLimit: 3 });
+        expectProblem(result.problems, 'recursion-limit');
+        expectNoProblems(decode(bytes, { recursionLimit: 10 }).problems);
+    });
+
+    it('decodes deep nesting in time proportional to its size', function () {
+        this.timeout(10000);
+        // Within the recursion limit each level is analysed once (the analysis cache
+        // stops the quadratic re-analysis of nested payloads); beyond it, content is
+        // left as bytes, so cost grows with size rather than with depth.
+        const nested = (depth: number): Uint8Array => {
+            let inner = hex('08 01 12 03 61 62 63');
+            for (let i = 0; i < depth; i++) inner = lenField(1, inner);
+            return inner;
+        };
+        const time = (bytes: Uint8Array) => {
+            const start = performance.now();
+            decode(bytes);
+            return performance.now() - start;
+        };
+        time(nested(100));
+        const small = time(nested(500));
+        const large = time(nested(2000));
+        expect(large, `500 deep: ${small.toFixed(1)}ms, 2000 deep: ${large.toFixed(1)}ms`).to.be.lessThan(small * 12);
+    });
+
     it('detects packed varints', () => {
         const f = field(hex('1a 03 01 02 03'), 3);
         expect(f.values).to.deep.equal([{ kind: 'int64', value: 1n }, { kind: 'int64', value: 2n }, { kind: 'int64', value: 3n }]);

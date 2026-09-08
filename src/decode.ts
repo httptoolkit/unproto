@@ -44,7 +44,7 @@ export function decode(input: Uint8Array, options: DecodeOptions = {}): DecodeRe
         type = findMessageType(schema, options.type, problems);
     } else {
         const rootName = options.rootName ?? 'Message';
-        schema = inferSchemaFromWire([wire], { rootName, recursionLimit });
+        schema = inferSchemaFromWire([wire], { rootName, recursionLimit }, problems);
         type = schema.types.get(rootName) as MessageType;
     }
 

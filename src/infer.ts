@@ -9,7 +9,16 @@ import {
     type Presence,
     type Schema
 } from './schema.ts';
-import { analyzeLen, isReasonableFloat, BYTES_SCORE, NEUTRAL_SCORE, type Candidate as LenCandidate, type LenAnalysis } from './heuristics.ts';
+import {
+    analyzeLen,
+    isReasonableFloat,
+    BYTES_SCORE,
+    NEUTRAL_SCORE,
+    type AnalysisCache,
+    type Candidate as LenCandidate,
+    type LenAnalysis
+} from './heuristics.ts';
+import type { Problem } from './problem.ts';
 
 export interface InferOptions {
     /** Name given to the root message type. Defaults to 'Message'. */
@@ -26,11 +35,11 @@ export function inferSchema(samples: readonly Uint8Array[], options: InferOption
     return inferSchemaFromWire(samples.map(s => decodeWire(s, { recursionLimit: options.recursionLimit })), options);
 }
 
-/** @internal Lets decode() reuse the wire records it has already read */
-export function inferSchemaFromWire(samples: readonly WireMessage[], options: InferOptions = {}): Schema {
+/** @internal Lets decode() reuse the wire records it has already read and collect inference problems */
+export function inferSchemaFromWire(samples: readonly WireMessage[], options: InferOptions = {}, problems: Problem[] = []): Schema {
     const rootName = options.rootName ?? 'Message';
     const types = new Map<string, NamedType>();
-    const inferrer = new Inferrer(types, options.recursionLimit ?? 100, new Set());
+    const inferrer = new Inferrer(types, options.recursionLimit ?? 100, new Set(), problems);
     inferrer.inferMessageType(inferrer.allocateName(rootName), samples.map(w => w.fields), 0);
     return inferrer.needsEditions
         ? { syntax: 'editions', edition: '2023', types }
@@ -49,11 +58,14 @@ export class Inferrer {
     /** The names in `types` that inference owns and may replace; anything else is left alone */
     readonly owned: Set<string>;
     readonly recursionLimit: number;
+    readonly problems: Problem[];
+    private readonly cache: AnalysisCache = new WeakMap();
 
-    constructor(types: Map<string, NamedType>, recursionLimit: number, owned: Set<string>) {
+    constructor(types: Map<string, NamedType>, recursionLimit: number, owned: Set<string>, problems: Problem[]) {
         this.types = types;
         this.recursionLimit = recursionLimit;
         this.owned = owned;
+        this.problems = problems;
     }
 
     /** Returns the name itself, or a numbered variant if a supplied type already uses it */
@@ -137,7 +149,15 @@ export class Inferrer {
             }
             case 2: {
                 const occurrences = all.filter(f => f.kind === 'len');
-                const analyses = occurrences.map(o => analyzeLen(o.bytes, depth, this.recursionLimit));
+                const analyses = occurrences.map(o => analyzeLen(o.bytes, depth, this.recursionLimit, this.cache));
+                const tooDeep = depth >= this.recursionLimit && occurrences.find(o => o.bytes.length > 0);
+                if (tooDeep) {
+                    this.problems.push({
+                        code: 'recursion-limit',
+                        message: `Field ${number} is nested deeper than the limit of ${this.recursionLimit}; its content was not analysed`,
+                        offset: tooDeep.range.start
+                    });
+                }
                 const evidence = {
                     varint: (counts.get(0) ?? 0) > 0,
                     i32: (counts.get(5) ?? 0) > 0,

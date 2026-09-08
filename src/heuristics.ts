@@ -1,4 +1,4 @@
-import { decodeWire, readVarint, type WireMessage } from './wire.ts';
+import { decodeWire, type WireMessage } from './wire.ts';
 
 /**
  * Scores in [0, 1] for each way a length-delimited payload could be read.
@@ -34,14 +34,23 @@ const utf8 = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
 /** How many nested length-delimited fields we look inside when scoring a candidate message */
 const MAX_NESTED_CHECKS = 8;
 
-export function analyzeLen(bytes: Uint8Array, depth: number, recursionLimit: number): LenAnalysis {
+/**
+ * Remembers the analysis of each payload by identity. Scoring a candidate
+ * message analyses its nested payloads, and inferring that message's type
+ * analyses them again, so without this deep nesting costs quadratic time.
+ */
+export type AnalysisCache = WeakMap<Uint8Array, LenAnalysis>;
+
+export function analyzeLen(bytes: Uint8Array, depth: number, recursionLimit: number, cache: AnalysisCache): LenAnalysis {
     if (bytes.length === 0) return { length: 0 };
+    const cached = cache.get(bytes);
+    if (cached) return cached;
 
     let message: LenAnalysis['message'];
     if (depth < recursionLimit) {
         const wire = decodeWire(bytes);
         if (wire.problems.length === 0 && wire.trailing === undefined && wire.fields.length > 0) {
-            message = { wire, score: scoreMessage(wire, bytes.length, depth, recursionLimit) };
+            message = { wire, score: scoreMessage(wire, bytes.length, depth, recursionLimit, cache) };
         }
     }
 
@@ -53,7 +62,7 @@ export function analyzeLen(bytes: Uint8Array, depth: number, recursionLimit: num
         // Not UTF-8
     }
 
-    return {
+    const analysis: LenAnalysis = {
         length: bytes.length,
         message,
         string,
@@ -61,6 +70,8 @@ export function analyzeLen(bytes: Uint8Array, depth: number, recursionLimit: num
         packedI32: analyzePackedFixed(bytes, 4),
         packedI64: analyzePackedFixed(bytes, 8)
     };
+    cache.set(bytes, analysis);
+    return analysis;
 }
 
 /** The best score of any reading other than opaque bytes, or 0 if there is none */
@@ -75,7 +86,6 @@ export function bestNonBytesScore(analysis: LenAnalysis): number {
 }
 
 function scoreString(value: string, bytes: Uint8Array, couldBeMessage: boolean): number {
-    if (value.includes('\0')) return 0.05;
     let total = 0;
     let printable = 0;
     let hardControls = 0;
@@ -94,7 +104,8 @@ function scoreString(value: string, bytes: Uint8Array, couldBeMessage: boolean):
     const ratio = printable / total;
     let score = ratio * ratio;
     // Control characters other than tab/newline hardly ever appear in real text, but
-    // are exactly what small tags and lengths look like
+    // are exactly what small tags and lengths look like. NUL is included: a single
+    // terminator is survivable, a scattering of them is not text.
     score -= 0.25 * hardControls;
     // Text rarely starts with a tab or newline; message fields 1 and 2 encode as those
     score -= 0.15 * leadingWhitespaceControls;
@@ -104,7 +115,7 @@ function scoreString(value: string, bytes: Uint8Array, couldBeMessage: boolean):
     return Math.max(0, score);
 }
 
-function scoreMessage(wire: WireMessage, payloadLength: number, depth: number, recursionLimit: number): number {
+function scoreMessage(wire: WireMessage, payloadLength: number, depth: number, recursionLimit: number, cache: AnalysisCache): number {
     let score = 0.6;
 
     const wireTypesByNumber = new Map<number, Set<number>>();
@@ -136,7 +147,7 @@ function scoreMessage(wire: WireMessage, payloadLength: number, depth: number, r
         if (field.kind === 'varint' && field.nonCanonical) hasNonCanonical = true;
         if (field.kind === 'len' && field.bytes.length > 0 && nestedChecked < MAX_NESTED_CHECKS) {
             nestedChecked++;
-            const best = bestNonBytesScore(analyzeLen(field.bytes, depth + 1, recursionLimit));
+            const best = bestNonBytesScore(analyzeLen(field.bytes, depth + 1, recursionLimit, cache));
             if (best >= 0.7) coveredBytes += field.bytes.length;
             else if (best > BYTES_SCORE) coveredBytes += field.bytes.length / 2;
             else nestedPenalty = Math.min(0.2, nestedPenalty + 0.1);
@@ -164,19 +175,36 @@ function scoreMessage(wire: WireMessage, payloadLength: number, depth: number, r
     return Math.max(0, Math.min(1, score));
 }
 
+// Classifies the varints in a payload from their byte lengths alone, without
+// materialising values: a canonical varint of n bytes is at least 2^(7(n-1)).
 function analyzePackedVarints(bytes: Uint8Array): LenAnalysis['packedVarint'] {
     let pos = 0;
     let count = 0;
     let zeros = 0;
     let wide = 0;
     let large = false;
+    let printableBytes = 0;
     while (pos < bytes.length) {
-        const varint = readVarint(bytes, pos, bytes.length);
-        if (varint === 'truncated' || varint === 'too-long' || varint.nonCanonical || varint.overflow) return undefined;
-        if (varint.value === 0n) zeros++;
-        if (varint.value >= 0x200000n) wide++;
-        if (varint.value >= 0x100000000n && varint.value < 0x8000000000000000n) large = true;
-        pos += varint.length;
+        const start = pos;
+        while (pos < bytes.length && bytes[pos]! >= 0x80) pos++;
+        if (pos >= bytes.length) return undefined;
+        const last = bytes[pos]!;
+        pos++;
+        const length = pos - start;
+        if (length > 10) return undefined;
+        if (length > 1 && last === 0) return undefined;
+        if (length === 10 && (last & 0x7e) !== 0) return undefined;
+        if (length === 1) {
+            if (last === 0) zeros++;
+            if (isPrintableAscii(last)) printableBytes++;
+        }
+        if (length >= 4) wide++;
+        if (length === 5) {
+            // The only width where 2^32 falls mid-range
+            if (last >= 0x10) large = true;
+        } else if (length >= 6 && length <= 9) {
+            large = true;
+        }
         count++;
     }
     if (count === 0) return undefined;
@@ -188,7 +216,13 @@ function analyzePackedVarints(bytes: Uint8Array): LenAnalysis['packedVarint'] {
     // Random binary that happens to parse as varints gives mostly wide values
     if (wide * 2 > count) score -= 0.15;
     else if (large) score -= 0.1;
+    // Any run of ASCII text is also a run of single-byte varints, which is no evidence at all
+    if (printableBytes * 5 >= count * 4) score -= 0.25;
     return { count, score };
+}
+
+function isPrintableAscii(byte: number): boolean {
+    return (byte >= 0x20 && byte <= 0x7e) || byte === 0x09 || byte === 0x0a || byte === 0x0d;
 }
 
 // "Small" means the top byte (fixed32) or top four bytes (fixed64) carry only sign

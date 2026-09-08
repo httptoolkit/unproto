@@ -35,7 +35,7 @@ export interface Field {
     readonly values: readonly Value[];
     /** The wire records this field was read from, in wire order */
     readonly raw: readonly WireField[];
-    /** Other readings, best first. Empty unless the field's type was inferred. */
+    /** Other readings, best first. Empty unless the field's type was inferred. Computed on first access. */
     readonly alternatives: readonly Alternative[];
 }
 

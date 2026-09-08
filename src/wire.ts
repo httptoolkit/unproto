@@ -122,6 +122,32 @@ export function readVarint(input: Uint8Array, pos: number, end: number): VarintR
     return 'too-long';
 }
 
+interface SmallVarint {
+    readonly value: number;
+    readonly length: number;
+    readonly nonCanonical: boolean;
+}
+
+/**
+ * Reads a varint that must fit in 32 bits (a tag or a length) without
+ * allocating a bigint. Anything needing more than seven bytes is at least
+ * 2^49 and reported as 'too-large' rather than decoded.
+ */
+export function readSmallVarint(input: Uint8Array, pos: number, end: number): SmallVarint | 'truncated' | 'too-long' | 'too-large' {
+    let value = 0;
+    for (let i = 0; i < 7; i++) {
+        if (pos + i >= end) return 'truncated';
+        const b = input[pos + i]!;
+        value += (b & 0x7f) * VARINT_SHIFT[i]!;
+        if (b < 0x80) return { value, length: i + 1, nonCanonical: i > 0 && b === 0 };
+    }
+    for (let i = 7; i < 10; i++) {
+        if (pos + i >= end) return 'truncated';
+        if (input[pos + i]! < 0x80) return 'too-large';
+    }
+    return 'too-long';
+}
+
 interface State {
     readonly input: Uint8Array;
     readonly base: number;
@@ -173,13 +199,13 @@ function readFields(state: State, start: number, end: number, depth: number, gro
 
     while (pos < end) {
         const tagStart = pos;
-        const tag = readVarint(input, pos, end);
+        const tag = readSmallVarint(input, pos, end);
         if (tag === 'truncated') return stop('truncated', 'Input ended in the middle of a tag', tagStart);
         if (tag === 'too-long') return stop('invalid-tag', 'Tag varint is longer than 10 bytes', tagStart);
-        if (tag.overflow || tag.value > 0xFFFFFFFFn) return stop('invalid-tag', 'Tag value does not fit in 32 bits', tagStart);
+        if (tag === 'too-large' || tag.value > 0xFFFFFFFF) return stop('invalid-tag', 'Tag value does not fit in 32 bits', tagStart);
         pos += tag.length;
 
-        const tagNumber = Number(tag.value);
+        const tagNumber = tag.value;
         const wireType = tagNumber & 0x7;
         const number = tagNumber >>> 3;
 
@@ -223,12 +249,12 @@ function readFields(state: State, start: number, end: number, depth: number, gro
                 break;
             }
             case 2: {
-                const length = readVarint(input, pos, end);
+                const length = readSmallVarint(input, pos, end);
                 if (length === 'truncated') return stop('truncated', `Input ended inside the length of field ${number}`, tagStart);
                 if (length === 'too-long') return stop('length-too-large', `Length of field ${number} is not a valid varint`, tagStart);
-                if (length.overflow || length.value > BigInt(MAX_LENGTH)) return stop('length-too-large', `Length of field ${number} exceeds 2^31 - 1`, tagStart);
+                if (length === 'too-large' || length.value > MAX_LENGTH) return stop('length-too-large', `Length of field ${number} exceeds 2^31 - 1`, tagStart);
                 const valueStart = pos + length.length;
-                const valueEnd = valueStart + Number(length.value);
+                const valueEnd = valueStart + length.value;
                 if (valueEnd > end) {
                     return stop('truncated', `Field ${number} declares ${length.value} bytes but only ${end - valueStart} remain`, tagStart);
                 }
@@ -254,7 +280,7 @@ function readFields(state: State, start: number, end: number, depth: number, gro
                     // The end tag may have been consumed by the inner call or handed up
                     // unconsumed by a deeper one, so recompute its extent from its start.
                     valueEnd = inner.endGroupTagStart!;
-                    const endTag = readVarint(input, valueEnd, end);
+                    const endTag = readSmallVarint(input, valueEnd, end);
                     groupEnd = valueEnd + (typeof endTag === 'string' ? 1 : endTag.length);
                 }
 

@@ -54,7 +54,7 @@ export function interpretMessage(
                     path: fieldPath
                 });
             }
-            const inferrer = new Inferrer(ctx.types, ctx.recursionLimit, ctx.inferred);
+            const inferrer = new Inferrer(ctx.types, ctx.recursionLimit, ctx.inferred, ctx.problems);
             def = inferrer.inferField(number, [occurrences], type?.fullName ?? 'Unknown', depth);
         }
         out.set(number, interpretField(occurrences, def, ctx, fieldPath, depth));
@@ -72,7 +72,30 @@ function interpretField(
 ): Field {
     const values = occurrences.flatMap(occ => interpretOccurrence(occ, def, ctx, path, depth));
 
-    const alternatives: Alternative[] = (def.inferred?.alternatives ?? []).map(alt => {
+    // Alternatives are only wanted when someone looks at them, and computing them
+    // for every field roughly doubles the work, so they are produced on first access
+    let alternatives: Alternative[] | undefined;
+    return {
+        number: def.number,
+        name: def.name,
+        def,
+        values,
+        raw: occurrences,
+        get alternatives() {
+            alternatives ??= interpretAlternatives(occurrences, def, ctx, path, depth);
+            return alternatives;
+        }
+    };
+}
+
+function interpretAlternatives(
+    occurrences: readonly WireField[],
+    def: FieldDef,
+    ctx: InterpretContext,
+    path: readonly number[],
+    depth: number
+): Alternative[] {
+    return (def.inferred?.alternatives ?? []).map(alt => {
         const altDef = fieldDef({
             ...def,
             type: alt.type,
@@ -87,8 +110,6 @@ function interpretField(
             values: occurrences.flatMap(occ => interpretOccurrence(occ, altDef, scratch, path, depth))
         };
     });
-
-    return { number: def.number, name: def.name, def, values, raw: occurrences, alternatives };
 }
 
 function interpretOccurrence(
