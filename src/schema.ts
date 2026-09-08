@@ -25,6 +25,10 @@ export interface AlternativeType {
 export interface InferenceNotes {
     /** Other readings of the observed data that were considered plausible, best first */
     readonly alternatives: readonly AlternativeType[];
+    /** How many of the sampled containing messages had this field */
+    readonly presentIn: number;
+    /** How many containing messages were sampled */
+    readonly samples: number;
 }
 
 export interface FieldDef {

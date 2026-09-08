@@ -12,10 +12,12 @@ import {
     type FieldType,
     type MessageType,
     type NamedType,
-    type ScalarType
+    type ScalarType,
+    type Schema
 } from './schema.ts';
 import type { Alternative, Field, Message, Value } from './values.ts';
 import { Inferrer } from './infer.ts';
+import type { AnalysisCache } from './heuristics.ts';
 
 export interface InterpretContext {
     /** All known types. Types inferred for unknown fields are added here. */
@@ -82,6 +84,67 @@ export function collectUnknownFields(
         }
         group.perSample.push(occurrences);
     }
+}
+
+/**
+ * Infers every field the schema lacks, each from all of its occurrences
+ * across every sample at once, so that every instance of a type sees the
+ * same definition and nothing is re-inferred (or replaced) along the way.
+ */
+export function inferUnknownFields(
+    samples: readonly (readonly WireField[])[],
+    type: MessageType,
+    ctx: InterpretContext,
+    cache?: AnalysisCache
+): void {
+    const groups = new Map<string, UnknownFieldGroup>();
+    for (const fields of samples) collectUnknownFields(fields, type, ctx, [], 0, groups);
+    if (groups.size === 0) return;
+    const inferrer = new Inferrer(ctx.types, ctx.recursionLimit, ctx.inferred, ctx.problems, cache);
+    for (const group of groups.values()) {
+        const def = inferrer.inferField(group.number, group.perSample, group.typeName, group.depth, group.path);
+        let fields = ctx.extensions.get(group.typeName);
+        if (!fields) {
+            fields = new Map();
+            ctx.extensions.set(group.typeName, fields);
+        }
+        fields.set(group.number, def);
+    }
+}
+
+/** The supplied schema plus inferred types, with inferred fields added to the types they were found in */
+export function extendSchema(schema: Schema, ctx: InterpretContext): Schema {
+    const types = new Map(ctx.types);
+    for (const [typeName, fields] of ctx.extensions) {
+        const original = types.get(typeName);
+        if (original?.kind !== 'message') continue;
+        types.set(typeName, { ...original, fields: new Map([...original.fields, ...fields]) });
+    }
+    return { ...schema, types };
+}
+
+/** Picks the message type to decode as, reporting a problem if that is not possible */
+export function findMessageType(schema: Schema, name: string | undefined, problems: Problem[]): MessageType | undefined {
+    if (name === undefined) {
+        const messages = [...schema.types.values()].filter((t): t is MessageType => t.kind === 'message');
+        if (messages.length === 1) return messages[0];
+        problems.push({
+            code: 'unknown-type',
+            message: messages.length === 0
+                ? 'The schema defines no message types; decoding heuristically'
+                : 'The schema defines several message types and none was chosen; decoding heuristically'
+        });
+        return undefined;
+    }
+    const type = schema.types.get(name);
+    if (type?.kind === 'message') return type;
+    problems.push({
+        code: 'unknown-type',
+        message: type
+            ? `${name} is an enum, not a message; decoding heuristically`
+            : `Message type ${name} is not defined in the schema; decoding heuristically`
+    });
+    return undefined;
 }
 
 /** Decodes a list of wire fields as a message of the given type (or heuristically if none). */

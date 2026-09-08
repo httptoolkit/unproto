@@ -34,7 +34,8 @@ export {
     type Schema
 } from './schema.ts';
 export type { Alternative, Field, IntKind, Message, Value } from './values.ts';
-export { inferSchema, type InferOptions } from './infer.ts';
+export { SchemaInferrer, inferSchema, type SchemaInferrerOptions } from './schema-inferrer.ts';
+export { printProto, type PrintProtoOptions } from './print.ts';
 export { decode, type DecodeOptions, type DecodeResult } from './decode.ts';
 export { toObject, type PlainObject, type PlainValue, type ToObjectOptions } from './object.ts';
 export { isValidProtobuf } from './validate.ts';

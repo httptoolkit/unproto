@@ -30,20 +30,16 @@ export interface InferOptions {
     readonly recursionLimit?: number;
 }
 
-/**
- * Infers a schema from one or more messages of the same type. With a single
- * sample every field is 'optional' and repeated only if it appears more
- * than once; more samples give better cardinality and type evidence.
- */
-export function inferSchema(samples: readonly Uint8Array[], options: InferOptions = {}): Schema {
-    return inferSchemaFromWire(samples.map(s => decodeWire(s, { recursionLimit: options.recursionLimit })), options);
-}
-
-/** @internal Lets decode() reuse the wire records it has already read and collect inference problems */
-export function inferSchemaFromWire(samples: readonly WireMessage[], options: InferOptions = {}, problems: Problem[] = []): Schema {
+/** @internal Infers a whole schema from wire-decoded samples of one message type */
+export function inferSchemaFromWire(
+    samples: readonly WireMessage[],
+    options: InferOptions = {},
+    problems: Problem[] = [],
+    cache?: AnalysisCache
+): Schema {
     const rootName = options.rootName ?? 'Message';
     const types = new Map<string, NamedType>();
-    const inferrer = new Inferrer(types, options.recursionLimit ?? 100, new Set(), problems);
+    const inferrer = new Inferrer(types, options.recursionLimit ?? 100, new Set(), problems, cache);
     inferrer.inferMessageType(inferrer.allocateName(rootName), samples.map(w => w.fields), 0, []);
     return inferrer.needsEditions
         ? { syntax: 'editions', edition: '2023', types }
@@ -63,13 +59,14 @@ export class Inferrer {
     readonly owned: Set<string>;
     readonly recursionLimit: number;
     readonly problems: Problem[];
-    private readonly cache: AnalysisCache = new WeakMap();
+    private readonly cache: AnalysisCache;
 
-    constructor(types: Map<string, NamedType>, recursionLimit: number, owned: Set<string>, problems: Problem[]) {
+    constructor(types: Map<string, NamedType>, recursionLimit: number, owned: Set<string>, problems: Problem[], cache?: AnalysisCache) {
         this.types = types;
         this.recursionLimit = recursionLimit;
         this.owned = owned;
         this.problems = problems;
+        this.cache = cache ?? new WeakMap();
     }
 
     /**
@@ -219,7 +216,11 @@ export class Inferrer {
             presence,
             packed,
             delimited,
-            inferred: { alternatives }
+            inferred: {
+                alternatives,
+                presentIn: perSample.filter(s => s.length > 0).length,
+                samples: perSample.length
+            }
         };
     }
 

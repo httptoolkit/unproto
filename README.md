@@ -65,6 +65,34 @@ toObject(result.message); // { id: 42n, name: 'Jane Doe', tags: ['a', 'b'] }
 
 The schema is applied leniently. Fields the schema does not mention are decoded heuristically, fields whose encoding contradicts the schema are kept raw, and each such case is reported in `result.problems` with the path to the field. Parsing `.proto` files and binary descriptor sets into this schema model is coming next.
 
+### Infer a schema from many messages, and print it
+
+```typescript
+import { SchemaInferrer, printProto } from 'unproto';
+
+const inferrer = new SchemaInferrer({ rootName: 'SearchResponse' });
+for (const body of capturedBodies) inferrer.add(body);
+
+const text = printProto(inferrer.schema(), { header: ['Inferred by unproto from 12 responses'] });
+```
+
+Every message adds evidence: a field seen twice in one message is `repeated`, one missing from some messages is `optional`, and readings that fit every occurrence win over readings that fit only some. The printed `.proto` notes what was seen and what else each field could be:
+
+```protobuf
+syntax = "proto3";
+
+message SearchResponse {
+  int64 field_1 = 1; // seen in 12 of 12 messages; could also be int32, uint64, sint64
+  repeated Field2 field_2 = 2; // seen in 9 of 12 messages; could also be bytes
+
+  message Field2 {
+    string field_1 = 1; // seen in 27 of 27 messages; could also be bytes
+  }
+}
+```
+
+To refine a schema over time, edit the printed file (rename fields, narrow types), build a schema from it, and pass it back as `base`: supplied definitions are kept untouched and only the fields it lacks are inferred and added.
+
 ### Check whether bytes are protobuf at all
 
 ```typescript
@@ -77,7 +105,9 @@ isValidProtobuf(bytes); // true if every byte is a well-formed field and there i
 
 - `decode(bytes, options?)`: decodes a message, inferring a schema if none is given. Options: `schema`, `type` (full name of the message type), `rootName` (for the inferred root type), `recursionLimit`.
 - `toObject(message, options?)`: flattens a decoded message to a plain object. Options: `keys` (`'auto'`, `'name'` or `'number'`), `prefix`.
-- `inferSchema(samples, options?)`: infers a schema from one or more messages of the same type.
+- `SchemaInferrer`: accumulates messages of one type with `add(bytes)`; `schema()` infers from everything added so far, `problems()` lists issues. Options: `rootName`, `recursionLimit`, `base` (a schema to extend) and `type`.
+- `inferSchema(samples, options?)`: the same in one call.
+- `printProto(schema, options?)`: renders a schema as `.proto` text (proto3, or edition 2023 when group encoding was seen). Options: `header` comment lines, `indent`.
 - `isValidProtobuf(bytes)`: wire-level validity check.
 - `schema`, `messageType`, `enumType`, `fieldDef`, `scalar`: helpers for building schemas by hand.
 
